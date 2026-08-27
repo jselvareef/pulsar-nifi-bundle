@@ -4,11 +4,32 @@
 
 | Bundle version | NiFi | Pulsar client | Java |
 |---|---|---|---|
+| `2.9.0-batchfix.1` | 2.9.0 | 4.2.2 | 21 |
 | `2.1.0` | 2.1.0 | 3.3.7 | 21 |
 
 The bundle version tracks the NiFi platform version it is built for; each release
 line targets one Pulsar client major. See [VERSIONING.md](VERSIONING.md) for the
 full scheme, branching model, and release process.
+
+## Fork build `2.9.0-batchfix.1`
+
+This build fixes `ConsumePulsar` / `ConsumePulsarRecord` ignoring **Consumer Message Batch Size**
+(one FlowFile per message instead of up to N messages per FlowFile). It is built from the upstream
+`v2.9.0` tag (NiFi 2.9.0, Pulsar client 4.2.2, Java 21) plus upstream commit `f8a15fb` (which makes the
+JUnit 4 suite actually run) and the fix itself. The version follows the `<nifi.version>[.<revision>]`
+scheme of [VERSIONING.md](VERSIONING.md) with a `-batchfix.1` qualifier so the artifacts cannot be
+confused with the upstream `2.9.0` release. Both NARs must always be installed with the **same**
+version: `nifi-pulsar-nar` declares `nifi-pulsar-client-service-nar` as its parent NAR.
+
+Only the **Mapped FlowFile Attributes** decide whether consecutive messages share a FlowFile. The
+Pulsar metadata attributes are derived from the whole batch:
+
+| Attribute | FlowFile with 1 message | FlowFile with N > 1 messages |
+|---|---|---|
+| `pulsar.message.id` | id of the message (unchanged) | not set |
+| `pulsar.message.id.first` / `pulsar.message.id.last` | id of the message | ids of the first / last message |
+| `pulsar.property.<name>` | every message property | only the properties whose value is identical in all N messages |
+| `message.count` (`record.count` for records) | `1` | `N` (number of records) |
 
 ## How to build
 
