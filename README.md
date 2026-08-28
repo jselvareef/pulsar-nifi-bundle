@@ -4,7 +4,7 @@
 
 | Bundle version | NiFi | Pulsar client | Java |
 |---|---|---|---|
-| `2.9.0-batchfix.4` | 2.9.0 | 4.2.2 | 21 |
+| `2.9.0-batchfix.5` | 2.9.0 | 4.2.2 | 21 |
 | `2.1.0` | 2.1.0 | 3.3.7 | 21 |
 
 The bundle version tracks the NiFi platform version it is built for; each release
@@ -118,7 +118,7 @@ topic currently carries.
 > Note that this validates the payload; it does not yet *encode* it. Producing records in the
 > topic's Avro or JSON schema from a NiFi record set is tracked separately.
 
-## Fork build `2.9.0-batchfix.4`
+## Fork build `2.9.0-batchfix.5`
 
 Fork build for NiFi 2.9.0 (upstream `main` has moved to NiFi 2.10.0, whose NARs do not load on 2.9.0).
 It is the upstream `v2.9.0` tag plus:
@@ -134,11 +134,17 @@ It is the upstream `v2.9.0` tag plus:
   attribute fallback — see the behaviour note above), #162 (bounded publish batch per trigger), #163
   (`ConsumePulsarRecord` no longer strands a FlowFile when parse-failure routing cannot write), #164 and #165
   (no empty FlowFiles or stray demarcators in async mode; new *Consumer Cache Size* property);
-- a fix for upstream #167, proposed upstream from this fork: `ConsumePulsar` and `ConsumePulsarRecord`
-  acknowledge a message only once the FlowFile carrying it has been committed, and never on a path that
-  rolls the session back, so a write error makes the broker redeliver the batch instead of losing it.
+- the fix for upstream #167 (merged upstream as #169) and its follow-up #170: `ConsumePulsar` and
+  `ConsumePulsarRecord` acknowledge a message only once the FlowFile carrying it has been committed, and
+  never on a path that rolls the session back, so a write error makes the broker redeliver the batch
+  instead of losing it;
+- upstream #171 (#34 phase 1): the publishers validate content against the topic's schema — see
+  [Publishing to topics that have a schema](#publishing-to-topics-that-have-a-schema) for the behaviour change;
+- a fix for upstream #174, proposed upstream from this fork: `ConsumePulsarRecord` writes a record set with
+  the merged schema of all its messages instead of the schema of its first message, so an inferred schema no
+  longer drops the fields that the first message of a batch happens to lack.
 
-The Testcontainers integration tests that upstream added with these fixes (#152, #159, #160, #161, #166) are
+The Testcontainers integration tests that upstream added with these fixes (#152, #159, #160, #161, #166, #171) are
 not carried on this build line because they need a Docker daemon.
 
 The version follows the `<nifi.version>[.<revision>]` scheme of [VERSIONING.md](VERSIONING.md) with a
