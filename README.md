@@ -4,7 +4,7 @@
 
 | Bundle version | NiFi | Pulsar client | Java |
 |---|---|---|---|
-| `2.9.0-batchfix.1` | 2.9.0 | 4.2.2 | 21 |
+| `2.9.0-batchfix.2` | 2.9.0 | 4.2.2 | 21 |
 | `2.1.0` | 2.1.0 | 3.3.7 | 21 |
 
 The bundle version tracks the NiFi platform version it is built for; each release
@@ -51,18 +51,24 @@ through *Mapped FlowFile Attributes*.
 > that comes from a message property has to be mapped through *Mapped FlowFile Attributes*
 > instead.
 
-## Fork build `2.9.0-batchfix.1`
+## Fork build `2.9.0-batchfix.2`
 
-This build fixes `ConsumePulsar` / `ConsumePulsarRecord` ignoring **Consumer Message Batch Size**
-(one FlowFile per message instead of up to N messages per FlowFile). It is built from the upstream
-`v2.9.0` tag (NiFi 2.9.0, Pulsar client 4.2.2, Java 21) plus upstream commit `f8a15fb` (which makes the
-JUnit 4 suite actually run) and the fix itself. The version follows the `<nifi.version>[.<revision>]`
-scheme of [VERSIONING.md](VERSIONING.md) with a `-batchfix.1` qualifier so the artifacts cannot be
-confused with the upstream `2.9.0` release. Both NARs must always be installed with the **same**
-version: `nifi-pulsar-nar` declares `nifi-pulsar-client-service-nar` as its parent NAR.
+Fork build for NiFi 2.9.0 (upstream `main` has moved to NiFi 2.10.0, whose NARs do not load on 2.9.0).
+It is the upstream `v2.9.0` tag plus:
 
-The attribute contract is documented in [Consumer FlowFile attributes](#consumer-flowfile-attributes) below.
+- upstream `f8a15fb` (makes the JUnit 4 suite run) and the Consumer Message Batch Size fix (upstream #142);
+- upstream follow-ups #144, #145 (partitioned topics in `ConsumePulsarRecord`), #147 (no exception when a
+  batch opens no record set), #149 (attribute docs), #150 (async acknowledgement Future leak) and
+  #155 (`PublisherLease` waited on none of the sends beyond the first 100);
+- a fork-only fix for upstream #156: `PublisherPool` now really pools producers per topic and closes every
+  producer when the processor stops (`PublishPulsarRecord` returns its lease after each FlowFile).
 
+The version follows the `<nifi.version>[.<revision>]` scheme of [VERSIONING.md](VERSIONING.md) with a
+`-batchfix.N` qualifier so the artifacts cannot be confused with the upstream `2.9.0` release. Both NARs
+must always be installed with the **same** version: `nifi-pulsar-nar` declares
+`nifi-pulsar-client-service-nar` as its parent NAR.
+
+The attribute contract is documented in [Consumer FlowFile attributes](#consumer-flowfile-attributes) above.
 
 ## How to build
 
