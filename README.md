@@ -4,7 +4,7 @@
 
 | Bundle version | NiFi | Pulsar client | Java |
 |---|---|---|---|
-| `2.9.0-batchfix.2` | 2.9.0 | 4.2.2 | 21 |
+| `2.9.0-batchfix.3` | 2.9.0 | 4.2.2 | 21 |
 | `2.1.0` | 2.1.0 | 3.3.7 | 21 |
 
 The bundle version tracks the NiFi platform version it is built for; each release
@@ -71,7 +71,7 @@ FlowFile:
 > partition a message routes to, and it makes the topic compactable by that key. If you relied on
 > the previous unkeyed behaviour, clear the `msg.key` attribute before the publish processor.
 
-## Fork build `2.9.0-batchfix.2`
+## Fork build `2.9.0-batchfix.3`
 
 Fork build for NiFi 2.9.0 (upstream `main` has moved to NiFi 2.10.0, whose NARs do not load on 2.9.0).
 It is the upstream `v2.9.0` tag plus:
@@ -80,8 +80,16 @@ It is the upstream `v2.9.0` tag plus:
 - upstream follow-ups #144, #145 (partitioned topics in `ConsumePulsarRecord`), #147 (no exception when a
   batch opens no record set), #149 (attribute docs), #150 (async acknowledgement Future leak) and
   #155 (`PublisherLease` waited on none of the sends beyond the first 100);
-- a fork-only fix for upstream #156: `PublisherPool` now really pools producers per topic and closes every
-  producer when the processor stops (`PublishPulsarRecord` returns its lease after each FlowFile).
+- the fix for upstream #156 (merged upstream as #158): `PublisherPool` now really pools producers per topic
+  and closes every producer when the processor stops (`PublishPulsarRecord` returns its lease after each
+  FlowFile);
+- upstream follow-ups #159 (the previous pool is closed when the processor is rescheduled), #161 (`msg.key`
+  attribute fallback — see the behaviour note above), #162 (bounded publish batch per trigger), #163
+  (`ConsumePulsarRecord` no longer strands a FlowFile when parse-failure routing cannot write), #164 and #165
+  (no empty FlowFiles or stray demarcators in async mode; new *Consumer Cache Size* property).
+
+The Testcontainers integration tests that upstream added with these fixes (#152, #159, #160, #161, #166) are
+not carried on this build line because they need a Docker daemon.
 
 The version follows the `<nifi.version>[.<revision>]` scheme of [VERSIONING.md](VERSIONING.md) with a
 `-batchfix.N` qualifier so the artifacts cannot be confused with the upstream `2.9.0` release. Both NARs
