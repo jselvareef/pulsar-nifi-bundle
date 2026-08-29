@@ -51,19 +51,6 @@ through *Mapped FlowFile Attributes*.
 > that comes from a message property has to be mapped through *Mapped FlowFile Attributes*
 > instead.
 
-### Record set schema
-
-`ConsumePulsarRecord` writes the consecutive messages that share the same mapped attributes
-(and topic) as one record set. The set is written with the schema of **all** of its messages:
-with an explicit schema every message resolves to the same one; with an inferred schema (the
-default of `JsonTreeReader`) the set gets the union of the fields its messages carry, and a
-field whose type differs between messages becomes a choice type. A record that lacks a field
-of the set's schema is written with that field as `null`.
-
-> Until this change the set was written with the schema of its **first** message, so with an
-> inferred schema every field that the first message did not have was silently dropped from the
-> rest of the set.
-
 ## Publisher message metadata
 
 `PublishPulsar` and `PublishPulsarRecord` set the message key and message properties from the
