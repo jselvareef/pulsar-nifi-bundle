@@ -4,12 +4,35 @@
 
 | Bundle version | NiFi | Pulsar client | Java |
 |---|---|---|---|
-| `2.9.0-batchfix.7` | 2.9.0 | 4.2.2 | 21 |
+| `2.10.0` | 2.10.0 | 4.2.4 | 21 |
+| `2.9.0-batchfix.8` | 2.9.0 | 4.2.2 | 21 |
+| `2.9.0` | 2.9.0 | 4.2.2 | 21 |
 | `2.1.0` | 2.1.0 | 3.3.7 | 21 |
+
+> **Pulsar major bump in `2.9.0`:** this release line moves the Pulsar client
+> from `3.x` to `4.x` (3.3.7 → 4.2.2). Consumers who must stay on the Pulsar 3.x
+> client should pin to the `2.1.0` release line.
 
 The bundle version tracks the NiFi platform version it is built for; each release
 line targets one Pulsar client major. See [VERSIONING.md](VERSIONING.md) for the
 full scheme, branching model, and release process.
+
+Release notes live in [`docs/release-notes/`](docs/release-notes/). `2.10.0` carries
+several behaviour changes — see [its notes](docs/release-notes/2.10.0.md) before upgrading.
+
+## Fork build `2.9.0-batchfix.8`
+
+Fork build for **NiFi 2.9.0** (upstream `main` targets NiFi 2.10.0, whose NARs do not load on 2.9.0).
+It carries the complete upstream content of `v2.10.0.1` — every fix and feature in
+[docs/release-notes/2.10.0.md](docs/release-notes/2.10.0.md), including the behaviour changes listed
+there — rebuilt against NiFi 2.9.0 / Pulsar client 4.2.2 / Java 21. `src/main` is identical to
+upstream `main` at `64755dd`; the Testcontainers integration tests (`*IT.java`) are not carried on
+this build line because they need a Docker daemon.
+
+The version follows the `<nifi.version>[.<revision>]` scheme of [VERSIONING.md](VERSIONING.md) with a
+`-batchfix.N` qualifier so the artifacts cannot be confused with an upstream release. Both NARs must
+always be installed together with the **same** version: `nifi-pulsar-nar` declares
+`nifi-pulsar-client-service-nar` as its parent NAR.
 
 ## Consumer FlowFile attributes
 
@@ -114,6 +137,79 @@ broker's acknowledgement.
 > either raise *Max Pending Messages*, set it to `0` to restore the previous unbounded behaviour, or
 > enable *Block if Message Queue Full* so sends wait instead of failing.
 
+## Consuming from topics that have a schema
+
+`ConsumePulsarRecord`'s **Message Schema Strategy** decides how a message becomes records.
+
+`Record Reader` (the default) parses each message with the configured reader, which has to match how the
+topic is encoded. That is not always obvious: an AVRO topic carries *bare Avro binary* — no file header
+and no embedded schema, because Pulsar keeps the schema in its registry — so it needs an `AvroReader`
+with *Schema Access Strategy* set to `Use 'Schema Text' Property`. Its *Schema Text* already defaults to
+`${avro.schema}`, which is the attribute this processor sets from the topic's registered schema, so the
+access strategy is the only field that has to change. Because `avro.schema` is part of what decides a
+record set's boundaries, a schema version change closes the current FlowFile and opens a new one carrying
+its own schema, and the reader is created with those attributes so `${avro.schema}` resolves for the
+reader itself rather than only downstream. A JSON topic carries text a `JsonTreeReader` can infer.
+Pointing the wrong reader at a topic sends every message to `parse.failure`.
+
+`Topic Schema` builds records from the schema the topic carries instead. The field definitions come from
+the broker — Pulsar attaches each message's schema to it — so no reader and no schema configuration are
+needed at all, and AVRO and JSON topics behave identically. Because the schema arrives per message,
+evolution is handled: a message published under an older version decodes with the version it was written
+with.
+
+A *Record Reader* may still be configured under `Topic Schema`, and messages the strategy cannot decode
+fall back to it — a topic with no schema at all, or one whose schema has no record shape. Without a
+reader to fall back to, those messages go to `parse.failure`. `KeyValue` schemas are not yet decoded this
+way.
+
+### Topics with a primitive schema
+
+A topic whose schema is a primitive — `STRING`, `BOOLEAN`, or one of the numeric types — carries one
+value per message and has no fields, so `Topic Schema` gives each message a record of a single field
+named by **Primitive Value Field** (`value` by default). It becomes a column name downstream, so it is
+worth setting to something meaningful.
+
+**Primitive Schema Handling** decides what happens when a *Record Reader* is also configured.
+`Record Reader if configured` — the default — parses the payload with the reader, which is what a `STRING`
+topic carrying JSON or CSV text wants. `Single-field record` always wraps the value instead.
+
+The choice is a property rather than an inference from whether a reader is set, because the reader is
+*also* the fallback for topics with no schema: configuring one for that reason should not silently change
+how primitive topics are read. Under the default, a `STRING` topic carrying plain text with a
+`JsonTreeReader` configured sends every message to `parse.failure`, since the reader cannot parse it and
+the single-field record is not reachable — `Single-field record` is the setting for that flow.
+
+Publishing to a primitive topic requires a record with **exactly one field**, whose value is coerced to
+the topic's type. A record with several fields has no unambiguous mapping onto a single value, so it is
+routed to `failure` rather than guessing which field was meant.
+
+`BYTES` is not treated as a primitive schema. Pulsar reports a topic with *no* schema as `BYTES` with an
+empty definition, so the two are indistinguishable, and treating it as primitive would capture every
+schema-less topic. The date and time schemas are not supported yet either.
+
+### Topics with a KeyValue schema
+
+A `KEY_VALUE` topic carries two schemas — one for the key, one for the value — and an encoding that says
+where the key is written. `INLINE` length-prefixes both into the payload; `SEPARATED` puts the key in the
+message's key metadata and only the value in the payload, which is what makes a topic compactable by key.
+Both are supported and behave the same to a flow.
+
+`Topic Schema` gives each message a record with two fields, named by **KeyValue Key Field** and
+**KeyValue Value Field** (`key` and `value` by default). Each side keeps the shape its own schema
+describes: a `STRING` key becomes a string field, an `AVRO` value becomes a nested record.
+
+Publishing needs a record with both of those fields. **On a `SEPARATED` topic the key field becomes the
+message key, so *Message Key Field* must not name a different field** — the two would overwrite each
+other, and the FlowFile is routed to `failure` rather than silently letting one win. Naming the *same*
+field is allowed: that asks for what the schema already guarantees. The topic's schema is not known until
+publish time, so this cannot be caught when the processor is configured.
+
+Because the schema's key becomes the message key on a `SEPARATED` topic, it is also the routing key — the
+same key lands on the same partition, and the topic is compactable by it, without configuring anything.
+On an `INLINE` topic the key metadata is unused by the schema, so *Message Key Field* still works there as
+the routing key.
+
 ## Publishing to topics that have a schema
 
 `PublishPulsar` and `PublishPulsarRecord` create their producers with
@@ -166,47 +262,6 @@ schema this strategy falls back to the Record Writer, so turning it on is safe e
 > schema-aware consumer decoded as all-null fields, with nothing reported at either end. `Topic
 > Schema` is the only strategy that produces messages such a consumer can read.
 
-## Fork build `2.9.0-batchfix.7`
-
-Fork build for NiFi 2.9.0 (upstream `main` has moved to NiFi 2.10.0, whose NARs do not load on 2.9.0).
-It is the upstream `v2.9.0` tag plus:
-
-- upstream `f8a15fb` (makes the JUnit 4 suite run) and the Consumer Message Batch Size fix (upstream #142);
-- upstream follow-ups #144, #145 (partitioned topics in `ConsumePulsarRecord`), #147 (no exception when a
-  batch opens no record set), #149 (attribute docs), #150 (async acknowledgement Future leak) and
-  #155 (`PublisherLease` waited on none of the sends beyond the first 100);
-- the fix for upstream #156 (merged upstream as #158): `PublisherPool` now really pools producers per topic
-  and closes every producer when the processor stops (`PublishPulsarRecord` returns its lease after each
-  FlowFile);
-- upstream follow-ups #159 (the previous pool is closed when the processor is rescheduled), #161 (`msg.key`
-  attribute fallback — see the behaviour note above), #162 (bounded publish batch per trigger), #163
-  (`ConsumePulsarRecord` no longer strands a FlowFile when parse-failure routing cannot write), #164 and #165
-  (no empty FlowFiles or stray demarcators in async mode; new *Consumer Cache Size* property);
-- the fix for upstream #167 (merged upstream as #169) and its follow-up #170: `ConsumePulsar` and
-  `ConsumePulsarRecord` acknowledge a message only once the FlowFile carrying it has been committed, and
-  never on a path that rolls the session back, so a write error makes the broker redeliver the batch
-  instead of losing it;
-- upstream #171 and #172 (#34 phases 1 and 2): the publishers validate content against the topic's schema
-  and encode records with it — see [Publishing to topics that have a schema](#publishing-to-topics-that-have-a-schema)
-  for the behaviour change — and #176 (`PublishPulsarRecord` keeps the records of a FlowFile in order);
-- the fix for upstream #174 (merged upstream as #179): `ConsumePulsarRecord` starts a new record set when
-  the record schema changes, so an inferred schema no longer drops the fields that the first message of a
-  batch happens to lack — see [Record sets and the record schema](#record-sets-and-the-record-schema);
-- upstream #177 (contributing guide) and #178 (#34 phase 3: records encoded with a JSON topic schema);
-- the fixes for upstream #180 (proposed as #182: *Message Routing Mode* and *Max Pending Messages* really
-  reach the producer — see [Message routing on partitioned topics](#message-routing-on-partitioned-topics))
-  and #181 (proposed as #183: `ConsumePulsarRecord` no longer throws on a topic without a schema).
-
-The Testcontainers integration tests that upstream added with these fixes (#152, #159, #160, #161, #166, #171, #172, #176, #178, #182, #183) are
-not carried on this build line because they need a Docker daemon.
-
-The version follows the `<nifi.version>[.<revision>]` scheme of [VERSIONING.md](VERSIONING.md) with a
-`-batchfix.N` qualifier so the artifacts cannot be confused with the upstream `2.9.0` release. Both NARs
-must always be installed with the **same** version: `nifi-pulsar-nar` declares
-`nifi-pulsar-client-service-nar` as its parent NAR.
-
-The attribute contract is documented in [Consumer FlowFile attributes](#consumer-flowfile-attributes) above.
-
 ## How to build
 
 To build the NAR files using Maven, just run the following commands. The first one makes sure that you are using Java 
@@ -238,6 +293,31 @@ streamnative/nifi
 See the [documentation](https://hub.docker.com/r/apache/nifi) on the base image for more configuration options
 
 Visit https://localhost:8443/nifi/#/login and enter the username and password you provided in the docker command.
+
+## Integration tests
+
+Alongside the unit tests (which run against a mocked Pulsar client) there are integration tests
+that drive the processors against a **real Pulsar broker**, started in Docker by
+[Testcontainers](https://java.testcontainers.org/). They cover behaviour the mocks cannot reach:
+real message ids, real acknowledgement semantics, subscription types and partitioned topics.
+
+They are named `*IT.java`, so Surefire ignores them - `mvn test` and `mvn package` stay fast and
+need no Docker. They run from `mvn verify`:
+
+```
+mvn verify                 # unit tests + integration tests (needs Docker)
+mvn verify -DskipITs       # unit tests only
+mvn test                   # unit tests only, no Docker required
+```
+
+The broker image is pinned by the `pulsar.image` property in the root pom and kept in step with
+`pulsar.version`.
+
+> **Docker 29 and newer:** docker-java (bundled with Testcontainers) negotiates API version 1.32 by
+> default, which Docker 29+ rejects with *"client version 1.32 is too old. Minimum supported API
+> version is 1.44"*. The build therefore passes `-Dapi.version=${docker.api.version}` (1.44) to the
+> integration tests. 1.44 requires Docker 25 or newer; on an older daemon override it, e.g.
+> `mvn verify -Ddocker.api.version=1.41`.
 
 ## How to debug
 

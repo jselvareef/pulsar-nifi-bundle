@@ -1,0 +1,288 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.nifi.processors.pulsar.utils;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+
+import org.apache.avro.generic.GenericDatumReader;
+import org.apache.avro.io.DecoderFactory;
+import org.apache.nifi.avro.AvroTypeUtil;
+import java.util.Collections;
+
+import org.apache.nifi.serialization.record.MapRecord;
+import org.apache.nifi.serialization.record.RecordField;
+import org.apache.nifi.serialization.SimpleRecordSchema;
+import org.apache.nifi.serialization.record.Record;
+import org.apache.nifi.serialization.record.RecordSchema;
+import org.apache.pulsar.common.schema.SchemaInfo;
+import org.apache.pulsar.common.schema.SchemaType;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+/**
+ * Builds NiFi records from the schema a Pulsar topic carries, rather than from a configured Record Reader.
+ * <p>
+ * The field definitions come from the broker, not from the payload and not from message properties: Pulsar
+ * keeps schemas in a registry keyed by topic and version, and {@code Schema.AUTO_CONSUME()} attaches the
+ * schema of each message's version as its reader schema. {@link SchemaInfo#getSchema()} is that definition,
+ * and for both {@code AVRO} and {@code JSON} topics it is an Avro schema document - only the
+ * {@link SchemaType} says how the payload itself is encoded. Because the definition arrives per message,
+ * schema evolution needs no special handling here: a message published under an older version decodes with
+ * the version it was written with.
+ * <p>
+ * This is the mirror of {@code PublisherLease}'s encoding, and deliberately decodes the bytes itself rather
+ * than using the value Pulsar already decoded. The Pulsar client shades Avro, so the record behind
+ * {@code msg.getValue()} is a {@code org.apache.pulsar.shade.org.apache.avro} type that NiFi's
+ * {@link AvroTypeUtil} cannot accept. Parsing the definition with unshaded Avro keeps both directions on
+ * the same conversion code.
+ */
+public class TopicSchemaRecordDecoder {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    /**
+     * The parsed schema, as one immutable snapshot behind a single volatile reference.
+     * <p>
+     * These were five separate mutable fields, read and replaced one at a time. Sharing one decoder across
+     * concurrent tasks then tore the cache: a thread could read another thread's Avro schema together with
+     * its own RecordSchema and return a record of the wrong shape with no exception raised (#195). Swapping
+     * one immutable object means a reader either sees the whole previous parse or the whole next one.
+     */
+    private volatile Parsed parsed;
+
+    /** One parse of one schema definition; every field is set together or not at all. */
+    private static final class Parsed {
+
+        private final String definition;
+        private final SchemaType type;
+        private final String primitiveField;
+        private final org.apache.avro.Schema avroSchema;
+        private final RecordSchema recordSchema;
+
+        private Parsed(final String definition, final SchemaType type, final String primitiveField,
+                final org.apache.avro.Schema avroSchema, final RecordSchema recordSchema) {
+            this.definition = definition;
+            this.type = type;
+            this.primitiveField = primitiveField;
+            this.avroSchema = avroSchema;
+            this.recordSchema = recordSchema;
+        }
+
+        private boolean matches(final String definition, final SchemaType type, final String primitiveField) {
+            return this.type == type && java.util.Objects.equals(this.definition, definition)
+                    && java.util.Objects.equals(this.primitiveField, primitiveField);
+        }
+    }
+
+    /** Used when a caller does not name the field, and the default of the processor property. */
+    public static final String DEFAULT_PRIMITIVE_FIELD = "value";
+
+    /**
+     * Whether records can be built from this schema. Only the two struct types Pulsar registers as an Avro
+     * document are supported; a topic with no schema reports {@code null} here, and a primitive or
+     * {@code KEY_VALUE} schema has no record shape to map, so both fall back to the Record Reader.
+     */
+    public static boolean supports(final SchemaInfo schemaInfo) {
+        return schemaInfo != null
+                && (schemaInfo.getType() == SchemaType.AVRO || schemaInfo.getType() == SchemaType.JSON
+                        || PrimitiveTopicSchema.supports(schemaInfo.getType()));
+    }
+
+    /**
+     * Whether this topic's schema is a single primitive value rather than a record (#189). Callers treat
+     * these differently: a primitive payload is often something a Record Reader should parse - JSON text on
+     * a STRING topic is a common shape - so a configured reader takes precedence over wrapping the value.
+     */
+    public static boolean isPrimitive(final SchemaInfo schemaInfo) {
+        return schemaInfo != null && PrimitiveTopicSchema.supports(schemaInfo.getType());
+    }
+
+    /**
+     * Decodes one message into a record shaped by the topic's schema.
+     *
+     * @param data the raw message payload
+     * @param schemaInfo the schema the message was published under, which must {@link #supports} it
+     * @return the decoded record
+     * @throws IOException if the payload does not match the schema
+     */
+    public Record decode(final byte[] data, final SchemaInfo schemaInfo) throws IOException {
+        return decode(data, schemaInfo, DEFAULT_PRIMITIVE_FIELD);
+    }
+
+    /**
+     * Decodes one message into a record shaped by the topic's schema.
+     *
+     * @param data the raw message payload
+     * @param schemaInfo the schema the message was published under, which must {@link #supports} it
+     * @param primitiveField the field name to give the value of a primitive topic
+     * @return the decoded record
+     * @throws IOException if the payload does not match the schema
+     */
+    public Record decode(final byte[] data, final SchemaInfo schemaInfo, final String primitiveField)
+            throws IOException {
+        if (PrimitiveTopicSchema.supports(schemaInfo.getType())) {
+            return decodePrimitive(data, schemaInfo.getType(), primitiveField);
+        }
+
+        final String definition = new String(schemaInfo.getSchema(), StandardCharsets.UTF_8);
+
+        Parsed current = parsed;
+
+        if (current == null || !current.matches(definition, schemaInfo.getType(), null)) {
+            final org.apache.avro.Schema avroSchema = new org.apache.avro.Schema.Parser().parse(definition);
+            current = new Parsed(definition, schemaInfo.getType(), null, avroSchema,
+                    AvroTypeUtil.createSchema(avroSchema));
+            parsed = current;
+        }
+
+        return schemaInfo.getType() == SchemaType.AVRO ? decodeAvro(data, current) : decodeJson(data, current);
+    }
+
+    /** AVRO topics carry bare Avro binary - no file header, no embedded schema - so the schema comes from us. */
+    private Record decodeAvro(final byte[] data, final Parsed current) throws IOException {
+        final GenericDatumReader<org.apache.avro.generic.GenericRecord> datumReader =
+                new GenericDatumReader<>(current.avroSchema);
+
+        final org.apache.avro.generic.GenericRecord avroRecord =
+                datumReader.read(null, DecoderFactory.get().binaryDecoder(data, null));
+
+        return new MapRecord(current.recordSchema,
+                AvroTypeUtil.convertAvroRecordToMap(avroRecord, current.recordSchema));
+    }
+
+    /**
+     * JSON topics carry plain JSON text - the shape Pulsar's own JSON schema writes, not Avro's JSON
+     * encoding - so it is parsed as JSON and coerced to the schema's types. Coercion matters because JSON
+     * has no way to distinguish an int from a long, or a string from a UUID.
+     */
+    @SuppressWarnings("unchecked")
+    private Record decodeJson(final byte[] data, final Parsed current) throws IOException {
+        final Map<String, Object> values = JSON.readValue(data, Map.class);
+
+        // Through DataTypeUtils rather than a MapRecord constructor, which does not convert a nested
+        // JSON object: without this a nested field comes back as a raw Map instead of a Record.
+        return org.apache.nifi.serialization.record.util.DataTypeUtils.toRecord(values, current.recordSchema, null);
+    }
+
+    /**
+     * A primitive topic has one value per message and no fields, so the record shape is chosen rather than
+     * derived: a single field, named by the caller, typed as the topic's schema.
+     */
+    private Record decodePrimitive(final byte[] data, final SchemaType type, final String fieldName)
+            throws IOException {
+        Parsed current = parsed;
+
+        if (current == null || !current.matches(null, type, fieldName)) {
+            current = new Parsed(null, type, fieldName, null, new SimpleRecordSchema(Collections.singletonList(
+                    new RecordField(fieldName, PrimitiveTopicSchema.dataTypeOf(type)))));
+            parsed = current;
+        }
+
+        return new MapRecord(current.recordSchema,
+                Collections.singletonMap(fieldName, PrimitiveTopicSchema.decode(type, data)), false, true);
+    }
+
+    /**
+     * Encodes a record with a struct schema, for the sides of a KeyValue topic (#190).
+     * <p>
+     * AVRO is written as bare binary and JSON as plain text, matching what {@code PublisherLease} writes
+     * for a whole message - a KeyValue side is the same encoding, just nested inside a larger payload.
+     *
+     * @param record the record to encode
+     * @param schemaInfo the AVRO or JSON schema of the side
+     * @return the encoded bytes
+     * @throws IOException if the record cannot be represented in the schema
+     */
+    public static byte[] encodeStruct(final Record record, final SchemaInfo schemaInfo) throws IOException {
+        final org.apache.avro.Schema avroSchema = new org.apache.avro.Schema.Parser()
+                .parse(new String(schemaInfo.getSchema(), StandardCharsets.UTF_8));
+
+        final org.apache.avro.generic.GenericRecord avroRecord;
+
+        try {
+            avroRecord = AvroTypeUtil.createAvroRecord(record, avroSchema);
+        } catch (final Exception e) {
+            throw new IOException("Unable to convert the record to " + avroSchema.getFullName(), e);
+        }
+
+        if (schemaInfo.getType() == SchemaType.JSON) {
+            // Through the same writer a whole JSON message uses. Building a map of the record's field
+            // values and handing it to Jackson looked equivalent and was not: a nested field arrives as a
+            // MapRecord, which Jackson cannot serialize, so any JSON side with a nested record failed to
+            // publish. Converting to an Avro record first and writing that gives nesting, unions and
+            // logical types the same treatment they get at the top level.
+            return writeAsJsonBytes(avroSchema, avroRecord);
+        }
+
+        final java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        final org.apache.avro.io.BinaryEncoder encoder =
+                org.apache.avro.io.EncoderFactory.get().binaryEncoder(out, null);
+        new org.apache.avro.generic.GenericDatumWriter<org.apache.avro.generic.GenericRecord>(avroSchema)
+                .write(avroRecord, encoder);
+        encoder.flush();
+        return out.toByteArray();
+    }
+
+    /**
+     * Renders a record as JSON text, through the same writer the publish path uses.
+     * <p>
+     * Takes the already-parsed Avro schema rather than a {@link SchemaInfo} so that a caller holding a
+     * cached schema does not re-parse it per message - {@code Schema.Parser().parse} is the expensive
+     * part of handling a small record.
+     *
+     * @param record the record to render
+     * @param avroSchema the parsed Avro schema describing it
+     * @return the record as JSON text
+     * @throws IOException if the record cannot be represented in the schema
+     */
+    public static String toJsonText(final Record record, final org.apache.avro.Schema avroSchema)
+            throws IOException {
+        final org.apache.avro.generic.GenericRecord avroRecord;
+
+        try {
+            avroRecord = AvroTypeUtil.createAvroRecord(record, avroSchema);
+        } catch (final Exception e) {
+            throw new IOException("Unable to convert the record to " + avroSchema.getFullName(), e);
+        }
+
+        return new String(writeAsJsonBytes(avroSchema, avroRecord), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * The one place a record becomes JSON. Shared by {@link #encodeStruct}, which needs the bytes to
+     * publish, and {@link #toJsonText}, which needs the text for a FlowFile attribute.
+     */
+    private static byte[] writeAsJsonBytes(final org.apache.avro.Schema avroSchema,
+            final org.apache.avro.generic.GenericRecord avroRecord) throws IOException {
+        final java.io.ByteArrayOutputStream json = new java.io.ByteArrayOutputStream();
+
+        try (com.fasterxml.jackson.core.JsonGenerator generator =
+                     new com.fasterxml.jackson.core.JsonFactory().createGenerator(json)) {
+            PublisherLease.writeAsJson(generator, avroSchema, avroRecord);
+        }
+
+        return json.toByteArray();
+    }
+
+    /** The schema the last decoded message was shaped by, for callers that group records into sets. */
+    public RecordSchema getLastRecordSchema() {
+        final Parsed current = parsed;
+        return current == null ? null : current.recordSchema;
+    }
+}

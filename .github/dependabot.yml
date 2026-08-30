@@ -1,6 +1,9 @@
 version: 2
 updates:
-  # Keep Maven dependencies (Pulsar, NiFi, Jackson, etc.) patched.
+  # All Maven dependency + plugin updates collapse into a SINGLE grouped PR
+  # (instead of one PR per dependency). Patch/minor bundles auto-merge once CI
+  # is green; a bundle that contains any major bump is held for manual review
+  # (see .github/workflows/dependabot-auto-merge.yml).
   - package-ecosystem: maven
     directory: "/"
     schedule:
@@ -8,8 +11,22 @@ updates:
     open-pull-requests-limit: 10
     labels:
       - dependencies
+    groups:
+      maven-all:
+        patterns:
+          - "*"
+    ignore:
+      # The NiFi parent POM is intentionally pinned to 2.1.0. Bumping it to a
+      # newer NiFi (e.g. 2.9.0) drags in a parent that bans JUnit 4 and requires
+      # a full JUnit 4->5 test migration (see PR #107). The build already targets
+      # NiFi via the nifi.version property, so the parent bump is deferred. Allow
+      # patch updates (2.1.x); block minor/major until we migrate to JUnit 5.
+      - dependency-name: "org.apache.nifi:nifi-extension-bundles"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
 
-  # Keep the GitHub Actions used in the workflows above up to date and pinned.
+  # All GitHub Actions updates collapse into a SINGLE grouped PR.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -17,3 +34,40 @@ updates:
     labels:
       - dependencies
       - ci
+    groups:
+      github-actions-all:
+        patterns:
+          - "*"
+
+  # Base image updates for the published container. Dependabot reads the literal
+  # tag in the Dockerfile's FROM line, which is why that tag is pinned literally
+  # rather than templated from the `nifi.version` Maven property - a property
+  # reference here would be invisible to Dependabot and the pin would go stale
+  # again (it had drifted to 2.1.0 while the bundle targeted 2.10.0).
+  - package-ecosystem: docker
+    directory: "/docker-image/src/main/docker/nifi"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+    groups:
+      docker-all:
+        patterns:
+          - "*"
+    ignore:
+      # The base image must track `nifi.version`, not lead it: the image ships a
+      # NiFi runtime that loads NARs compiled against that exact NiFi version, and
+      # a mismatch in EITHER direction is an API gap between the platform and its
+      # extensions. Allow patch updates (2.10.x), which are security and bugfix
+      # releases within the same NiFi minor; block minor and major so the base
+      # image only moves when someone deliberately bumps `nifi.version` and the
+      # FROM line together.
+      #
+      # Without this, Dependabot proposed apache/nifi 2.10.0 -> 2.11.0 within
+      # minutes of the docker ecosystem being added, and the auto-merge workflow
+      # armed it - it only holds MAJOR bumps. Neither CI check builds the
+      # docker-image module, so nothing would have caught the desync.
+      - dependency-name: "apache/nifi"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor

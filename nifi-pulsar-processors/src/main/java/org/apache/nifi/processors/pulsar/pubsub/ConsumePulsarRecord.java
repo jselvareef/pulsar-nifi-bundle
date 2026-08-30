@@ -37,7 +37,10 @@ import org.apache.nifi.annotation.behavior.WritesAttributes;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.ValidationContext;
+import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.ProcessContext;
@@ -47,6 +50,8 @@ import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.processors.pulsar.AbstractPulsarConsumerProcessor;
 import org.apache.nifi.processors.pulsar.utils.MessageBatchAttributes;
+import org.apache.nifi.processors.pulsar.utils.KeyValueTopicSchema;
+import org.apache.nifi.processors.pulsar.utils.TopicSchemaRecordDecoder;
 import org.apache.nifi.schema.access.SchemaNotFoundException;
 import org.apache.nifi.serialization.*;
 import org.apache.nifi.serialization.record.Record;
@@ -88,12 +93,95 @@ public class ConsumePulsarRecord extends AbstractPulsarConsumerProcessor<Generic
     public static final String MSG_COUNT = "record.count";
     private static final String RECORD_SEPARATOR = "\n";
 
+    static final AllowableValue SCHEMA_FROM_RECORD_READER = new AllowableValue("Record Reader", "Record Reader",
+            "Parse each message with the configured Record Reader. The reader has to match how the topic is "
+            + "encoded: an AVRO topic carries bare Avro binary and needs an AvroReader whose Schema Text is "
+            + "${avro.schema}, while a JSON topic carries text a JsonTreeReader can infer.");
+
+    static final AllowableValue SCHEMA_FROM_TOPIC = new AllowableValue("Topic Schema", "Topic Schema",
+            "Build records from the schema the topic carries, which the broker sends with every message. No "
+            + "Record Reader is needed and AVRO and JSON topics behave identically. Messages from a topic "
+            + "with no schema, or with a schema that has no record shape, fall back to the Record Reader.");
+
+    public static final PropertyDescriptor MESSAGE_SCHEMA_STRATEGY = new PropertyDescriptor.Builder()
+            .name("MESSAGE_SCHEMA_STRATEGY")
+            .displayName("Message Schema Strategy")
+            .description("How Pulsar messages are turned into records. 'Topic Schema' uses the schema "
+                    + "registered on the topic, so the encoding is handled for you; 'Record Reader' uses the "
+                    + "configured reader, which must match the topic's encoding.")
+            .required(false)
+            .allowableValues(SCHEMA_FROM_RECORD_READER, SCHEMA_FROM_TOPIC)
+            .defaultValue(SCHEMA_FROM_RECORD_READER.getValue())
+            .build();
+
+    static final AllowableValue PRIMITIVE_VIA_READER = new AllowableValue("Record Reader if configured",
+            "Record Reader if configured",
+            "Parse the payload with the Record Reader when one is configured, and wrap it in a single field "
+            + "only when there is none. Suits a STRING topic carrying JSON or CSV text.");
+
+    static final AllowableValue PRIMITIVE_AS_RECORD = new AllowableValue("Single-field record",
+            "Single-field record",
+            "Always wrap the value in a single field, whether a Record Reader is configured or not. Suits a "
+            + "topic whose values are genuinely scalar, and leaves the reader free to serve as the fallback "
+            + "for topics that have no schema.");
+
+    public static final PropertyDescriptor PRIMITIVE_SCHEMA_HANDLING = new PropertyDescriptor.Builder()
+            .name("PRIMITIVE_SCHEMA_HANDLING")
+            .displayName("Primitive Schema Handling")
+            .description("What to do with a topic whose schema is a primitive. Only used by the 'Topic "
+                    + "Schema' strategy. The default defers to the Record Reader when one is configured, "
+                    + "which is what a STRING topic carrying JSON text wants; choose 'Single-field record' "
+                    + "when the values really are scalar, so that configuring a reader as the schema-less "
+                    + "fallback does not change how primitive topics are read.")
+            .required(false)
+            .allowableValues(PRIMITIVE_VIA_READER, PRIMITIVE_AS_RECORD)
+            .defaultValue(PRIMITIVE_VIA_READER.getValue())
+            .build();
+
+    public static final PropertyDescriptor PRIMITIVE_VALUE_FIELD = new PropertyDescriptor.Builder()
+            .name("PRIMITIVE_VALUE_FIELD")
+            .displayName("Primitive Value Field")
+            .description("The field name to give the value of a topic whose schema is a primitive - a "
+                    + "STRING or INT32 topic, for instance - which carries one value per message and has no "
+                    + "fields of its own. Only used by the 'Topic Schema' strategy, and only when no Record "
+                    + "Reader is configured: a reader takes precedence, so JSON text on a STRING topic can "
+                    + "still be parsed into records rather than wrapped in a single field.")
+            .required(false)
+            .defaultValue(TopicSchemaRecordDecoder.DEFAULT_PRIMITIVE_FIELD)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.ENVIRONMENT)
+            .build();
+
+    public static final PropertyDescriptor KEY_VALUE_KEY_FIELD = new PropertyDescriptor.Builder()
+            .name("KEY_VALUE_KEY_FIELD")
+            .displayName("KeyValue Key Field")
+            .description("The field name to give the key of a topic whose schema is a KeyValue schema. Only "
+                    + "used by the 'Topic Schema' strategy.")
+            .required(false)
+            .defaultValue(KeyValueTopicSchema.DEFAULT_KEY_FIELD)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.ENVIRONMENT)
+            .build();
+
+    public static final PropertyDescriptor KEY_VALUE_VALUE_FIELD = new PropertyDescriptor.Builder()
+            .name("KEY_VALUE_VALUE_FIELD")
+            .displayName("KeyValue Value Field")
+            .description("The field name to give the value of a topic whose schema is a KeyValue schema. "
+                    + "Only used by the 'Topic Schema' strategy.")
+            .required(false)
+            .defaultValue(KeyValueTopicSchema.DEFAULT_VALUE_FIELD)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.ENVIRONMENT)
+            .build();
+
     public static final PropertyDescriptor RECORD_READER = new PropertyDescriptor.Builder()
             .name("Record Reader")
             .displayName("Record Reader")
-            .description("The Record Reader to use for incoming FlowFiles")
+            .description("The Record Reader to use for incoming FlowFiles. Required unless Message Schema "
+                    + "Strategy is 'Topic Schema', which still falls back to this reader for messages from a "
+                    + "topic that has no schema.")
             .identifiesControllerService(RecordReaderFactory.class)
-            .required(true)
+            .required(false)
             .build();
 
     public static final PropertyDescriptor RECORD_WRITER = new PropertyDescriptor.Builder()
@@ -119,11 +207,45 @@ public class ConsumePulsarRecord extends AbstractPulsarConsumerProcessor<Generic
             .description("FlowFiles for which the content cannot be parsed.")
             .build();
 
+    /**
+     * The Record Reader stays required under the default strategy, so an existing configuration that omits
+     * it is still invalid for the same reason it always was. Under 'Topic Schema' it is optional, but it is
+     * still what messages from a schema-less topic fall back to - without it those go to parse.failure.
+     */
+    @Override
+    protected Collection<ValidationResult> customValidate(final ValidationContext validationContext) {
+        // Seeded with the superclass results, not an empty list: AbstractPulsarConsumerProcessor enforces
+        // that exactly one of Topics / Topics Pattern is set and that Acknowledgment Timeout is at least
+        // 10 seconds, and starting empty silently dropped both for this processor (#194).
+        final Collection<ValidationResult> results = new ArrayList<>(super.customValidate(validationContext));
+
+        if (!usesTopicSchema(validationContext.getProperty(MESSAGE_SCHEMA_STRATEGY).getValue())
+                && !validationContext.getProperty(RECORD_READER).isSet()) {
+            results.add(new ValidationResult.Builder()
+                    .subject(RECORD_READER.getDisplayName())
+                    .valid(false)
+                    .explanation("is required unless " + MESSAGE_SCHEMA_STRATEGY.getDisplayName()
+                            + " is '" + SCHEMA_FROM_TOPIC.getDisplayName() + "'")
+                    .build());
+        }
+
+        return results;
+    }
+
+    static boolean usesTopicSchema(final String strategy) {
+        return SCHEMA_FROM_TOPIC.getValue().equals(strategy);
+    }
+
     private static final List<PropertyDescriptor> PROPERTIES;
     private static final Set<Relationship> RELATIONSHIPS;
 
     static {
         final List<PropertyDescriptor> properties = new ArrayList<>();
+        properties.add(MESSAGE_SCHEMA_STRATEGY);
+        properties.add(PRIMITIVE_SCHEMA_HANDLING);
+        properties.add(PRIMITIVE_VALUE_FIELD);
+        properties.add(KEY_VALUE_KEY_FIELD);
+        properties.add(KEY_VALUE_VALUE_FIELD);
         properties.add(RECORD_READER);
         properties.add(RECORD_WRITER);
         properties.add(MAX_WAIT_TIME);
@@ -266,9 +388,28 @@ public class ConsumePulsarRecord extends AbstractPulsarConsumerProcessor<Generic
         // Cumulative acks are NOT permitted on Shared subscriptions
         final boolean shared = isSharedSubscription(context);
 
+        final boolean useTopicSchema = usesTopicSchema(context.getProperty(MESSAGE_SCHEMA_STRATEGY).getValue());
+
+        // Created per batch rather than held on the processor. Concurrent Tasks > 1 gave every task the
+        // same decoder, and its schema cache was read and replaced without synchronization, so two tasks
+        // decoding different schemas returned each other's records - silently, with no exception, straight
+        // to success (#195). One decoder per batch parses each definition once per trigger, which is
+        // cheap, and shares nothing.
+        final TopicSchemaRecordDecoder topicSchemaDecoder = new TopicSchemaRecordDecoder();
+        final KeyValueTopicSchema keyValueDecoder = new KeyValueTopicSchema();
+        // Its own instance, not the one above: this parses under the default field names while the
+        // record decoder parses under the configured ones, and a single decoder alternating between
+        // the two would re-parse the schema on every message.
+        final KeyValueTopicSchema keyAttributeDecoder = new KeyValueTopicSchema();
+        final String primitiveField = context.getProperty(PRIMITIVE_VALUE_FIELD).evaluateAttributeExpressions().getValue();
+        final String kvKeyField = context.getProperty(KEY_VALUE_KEY_FIELD).evaluateAttributeExpressions().getValue();
+        final String kvValueField = context.getProperty(KEY_VALUE_VALUE_FIELD).evaluateAttributeExpressions().getValue();
+        final boolean deferPrimitivesToReader =
+                PRIMITIVE_VIA_READER.getValue().equals(context.getProperty(PRIMITIVE_SCHEMA_HANDLING).getValue());
+
         try {
             for (Message<GenericRecord> msg : groupedMessages) {
-                currentAttributes = getMappedFlowFileAttributes(context, msg);
+                currentAttributes = getMappedFlowFileAttributes(context, msg, keyAttributeDecoder);
                 // Introduce an attribute to distinguish between current and previously captured attributes,
                 // particularly when the message originates from a different topic.
                 currentAttributes.put("topicName", getLogicalTopicName(msg.getTopicName()));
@@ -288,20 +429,56 @@ public class ConsumePulsarRecord extends AbstractPulsarConsumerProcessor<Generic
                 final byte[] data = msg.getData();
                 RecordReader reader = null;
                 RecordSchema currentSchema = null;
+                Record topicSchemaRecord = null;
 
-                try {
-                    reader = readerFactory.createRecordReader(currentAttributes, new ByteArrayInputStream(data), data.length, getLogger());
-                    currentSchema = reader.getSchema();
-                } catch (MalformedRecordException | IOException | SchemaNotFoundException e) {
-                    IOUtils.closeQuietly(reader);
-                    reader = null;
+                // What a primitive topic does is chosen by Primitive Schema Handling rather than inferred
+                // from whether a reader happens to be set. A STRING topic carrying JSON text wants the
+                // reader; a genuinely scalar topic wants the single field - and because the reader is also
+                // the fallback for schema-less topics, configuring one for that reason must not silently
+                // decide this too. Deferring to the reader is the default, so nothing changes by upgrading.
+                final boolean readerWins = readerFactory != null && deferPrimitivesToReader
+                        && TopicSchemaRecordDecoder.isPrimitive(readerSchemaInfo);
+
+                if (useTopicSchema && KeyValueTopicSchema.supports(readerSchemaInfo)) {
+                    // A KeyValue topic's key is either length-prefixed in the payload (INLINE) or carried
+                    // in the message's key metadata (SEPARATED), so the message has to be consulted for
+                    // it, not just its payload.
+                    try {
+                        topicSchemaRecord = keyValueDecoder.decode(data, msg.hasKey() ? msg.getKeyBytes() : null,
+                                readerSchemaInfo, kvKeyField, kvValueField);
+                        currentSchema = topicSchemaRecord.getSchema();
+                    } catch (final IOException | RuntimeException e) {
+                        getLogger().debug("Unable to decode a message with the topic's KeyValue schema", e);
+                        topicSchemaRecord = null;
+                    }
+                } else if (useTopicSchema && !readerWins && TopicSchemaRecordDecoder.supports(readerSchemaInfo)) {
+                    // The topic's schema decides the record's shape, so no reader is consulted at all. One
+                    // message is one record here: a schema-bearing topic carries a single encoded value per
+                    // message, unlike a reader, which may find several records in one payload.
+                    try {
+                        topicSchemaRecord = topicSchemaDecoder.decode(data, readerSchemaInfo, primitiveField);
+                        currentSchema = topicSchemaRecord.getSchema();
+                    } catch (final IOException | RuntimeException e) {
+                        getLogger().debug("Unable to decode a message with the topic's schema", e);
+                        topicSchemaRecord = null;
+                    }
+                } else if (readerFactory != null) {
+                    // Either the configured strategy is the Record Reader, or the topic has no schema to
+                    // decode with - a schema-less topic, or one whose schema has no record shape.
+                    try {
+                        reader = readerFactory.createRecordReader(currentAttributes, new ByteArrayInputStream(data), data.length, getLogger());
+                        currentSchema = reader.getSchema();
+                    } catch (MalformedRecordException | IOException | SchemaNotFoundException e) {
+                        IOUtils.closeQuietly(reader);
+                        reader = null;
+                    }
                 }
 
                 // if the current message's mapped attribute values - or its schema - differ from the open
                 // record set's, write out the active record set and clear various references so that we'll
                 // start a new one. An unparseable message has no schema and leaves the open set as it is.
                 if (lastAttributes != null && (!lastAttributes.equals(currentAttributes)
-                        || (reader != null && !schema.equals(currentSchema)))) {
+                        || (currentSchema != null && !schema.equals(currentSchema)))) {
                     WriteResult result = writer.finishRecordSet();
                     IOUtils.closeQuietly(writer);
                     IOUtils.closeQuietly(rawOut);
@@ -332,7 +509,7 @@ public class ConsumePulsarRecord extends AbstractPulsarConsumerProcessor<Generic
                 // purpose, so it is acknowledged with the commit of the FlowFiles it belongs to
                 uncommitted.add(msg);
 
-                if (reader == null) {
+                if (reader == null && topicSchemaRecord == null) {
                     // the message could not be parsed: it is routed to parse_failure with the rest of the set
                     parseFailures.add(msg);
                     continue;
@@ -371,9 +548,14 @@ public class ConsumePulsarRecord extends AbstractPulsarConsumerProcessor<Generic
                 // have the same mapped flowfile attribute values and the same schema, which means that it's ok
                 // that they are all placed in the same output flowfile.
                 try {
-                    for (Record record = reader.nextRecord(); record != null; record = reader.nextRecord()) {
-                        writer.write(record);
+                    if (topicSchemaRecord != null) {
+                        writer.write(topicSchemaRecord);
                         writtenRecords++;
+                    } else {
+                        for (Record record = reader.nextRecord(); record != null; record = reader.nextRecord()) {
+                            writer.write(record);
+                            writtenRecords++;
+                        }
                     }
                 } catch (MalformedRecordException | IOException e) {
                     parseFailures.add(msg);

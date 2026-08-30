@@ -67,6 +67,9 @@ public class PublisherLease implements Closeable {
     private final Schema<byte[]> topicSchema;
 
     /** The topic's schema, parsed once and re-parsed only if the definition itself changes. */
+    /** Holds the parsed key and value schemas of a KeyValue topic between records. */
+    private final KeyValueTopicSchema keyValueTopicSchema = new KeyValueTopicSchema();
+
     private String cachedSchemaDefinition;
     private TopicSchema cachedTopicSchema;
 
@@ -87,6 +90,38 @@ public class PublisherLease implements Closeable {
      * Producers are created with {@code Schema.AUTO_PRODUCE_BYTES()}, which binds to the topic when the
      * producer is created and then reports the topic's registered SchemaInfo.
      */
+    /**
+     * The topic's schema type, or null when it has none. Kept separate from {@link #getTopicSchema()},
+     * which only answers for the two struct types that map to an Avro document; a primitive topic (#189)
+     * has a type but no record shape.
+     */
+    /** The topic's SchemaInfo as the client reports it, or null when the topic has none. */
+    SchemaInfo rawTopicSchemaInfo() {
+        if (topicSchema == null) {
+            return null;
+        }
+
+        try {
+            return topicSchema.getSchemaInfo();
+        } catch (final RuntimeException e) {
+            return null;
+        }
+    }
+
+    SchemaType getTopicSchemaType() {
+        if (topicSchema == null) {
+            return null;
+        }
+
+        try {
+            final SchemaInfo info = topicSchema.getSchemaInfo();
+            return info == null ? null : info.getType();
+        } catch (final RuntimeException e) {
+            // getSchemaInfo() throws when the schema was never bound to a topic
+            return null;
+        }
+    }
+
     TopicSchema getTopicSchema() {
         if (topicSchema == null) {
             return null;
@@ -201,12 +236,34 @@ public class PublisherLease implements Closeable {
     public void publish(final FlowFile flowFile, final RecordSet recordSet, final RecordSetWriterFactory writerFactory,
                         final RecordSchema schema, final String messageKeyField, Map<String, String> messageProperties,
                         boolean async, boolean useTopicSchema) throws IOException {
+        publish(flowFile, recordSet, writerFactory, schema, messageKeyField, messageProperties, async, useTopicSchema,
+                KeyValueTopicSchema.DEFAULT_KEY_FIELD, KeyValueTopicSchema.DEFAULT_VALUE_FIELD);
+    }
+
+    /**
+     * @param keyValueKeyField the record field holding the key of a KeyValue topic
+     * @param keyValueValueField the record field holding its value
+     */
+    public void publish(final FlowFile flowFile, final RecordSet recordSet, final RecordSetWriterFactory writerFactory,
+                        final RecordSchema schema, final String messageKeyField, Map<String, String> messageProperties,
+                        boolean async, boolean useTopicSchema, final String keyValueKeyField,
+                        final String keyValueValueField) throws IOException {
 
         final TopicSchema resolvedSchema = useTopicSchema ? getTopicSchema() : null;
 
         if (useTopicSchema && resolvedSchema == null) {
             logger.debug("The topic carries no Avro or JSON schema; encoding with the configured record writer instead");
         }
+
+        // A primitive topic takes the record's single field as its whole payload, so it is neither an Avro
+        // encode nor a Record Writer serialization.
+        final SchemaType primitiveType = useTopicSchema && resolvedSchema == null
+                && PrimitiveTopicSchema.supports(getTopicSchemaType()) ? getTopicSchemaType() : null;
+
+        // A KeyValue topic carries two schemas; the key goes either inside the payload (INLINE) or into
+        // the message's key metadata (SEPARATED), so it is neither of the paths below.
+        final SchemaInfo keyValueSchema = useTopicSchema && resolvedSchema == null
+                && KeyValueTopicSchema.supports(rawTopicSchemaInfo()) ? rawTopicSchemaInfo() : null;
 
         final org.apache.avro.Schema avroSchema = resolvedSchema == null ? null : resolvedSchema.getDefinition();
         final boolean encodeAsJson = resolvedSchema != null && resolvedSchema.isJson();
@@ -232,7 +289,39 @@ public class PublisherLease implements Closeable {
                 final byte[] messageContent;
                 final String messageKey;
 
-                if (avroSchema != null) {
+                if (keyValueSchema != null) {
+                    final KeyValueTopicSchema.EncodedKeyValue encoded =
+                            keyValueTopicSchema.encode(record, keyValueSchema, keyValueKeyField, keyValueValueField);
+                    messageContent = encoded.getPayload();
+
+                    if (encoded.getMessageKey() != null) {
+                        // The schema owns the message key on a SEPARATED topic, so Message Key Field cannot
+                        // also own it. Refusing beats silently overwriting one with the other; the topic's
+                        // schema is not knowable at validation time, so this has to be caught here.
+                        //
+                        // Naming the same field is not a conflict: the user is asking for exactly what the
+                        // schema already guarantees, and failing there would surprise anyone who set both
+                        // for clarity. Only a genuine disagreement is refused.
+                        if (messageKeyField != null && !messageKeyField.isEmpty()
+                                && !messageKeyField.equals(keyValueKeyField)) {
+                            throw new IOException("The topic's KeyValue schema is SEPARATED, so its key field "
+                                    + "'" + keyValueKeyField + "' becomes the message key; remove Message Key "
+                                    + "Field, which would overwrite it");
+                        }
+
+                        futureList.add(async
+                                ? sendAsyncWithKeyBytes(producer, encoded.getMessageKey(), messageProperties, messageContent)
+                                : sendWithKeyBytes(producer, encoded.getMessageKey(), messageProperties, messageContent));
+
+                        if (futureList.size() > 100) {
+                            producer.flush();
+                            awaitAll(futureList);
+                        }
+                        continue;
+                    }
+                } else if (primitiveType != null) {
+                    messageContent = encodeWithPrimitiveTopicSchema(record, primitiveType);
+                } else if (avroSchema != null) {
                     if (encodeAsJson) {
                         encodeWithTopicJsonSchema(record, avroSchema, jsonFactory, baos);
                     } else {
@@ -307,6 +396,26 @@ public class PublisherLease implements Closeable {
      * @return the encoded message content
      * @throws IOException if the record cannot be converted or encoded
      */
+    /**
+     * Encodes a record for a topic whose schema is a single primitive value. The record must have exactly
+     * one field: a primitive topic carries one value per message, so a record with several fields has no
+     * unambiguous mapping onto it, and guessing which field was meant would publish the wrong data
+     * silently. Failing here routes the FlowFile to failure with a message naming the fields instead.
+     */
+    private byte[] encodeWithPrimitiveTopicSchema(final Record record, final SchemaType primitiveType)
+            throws IOException {
+        final List<String> fields = record.getSchema().getFieldNames();
+
+        if (fields.size() != 1) {
+            throw new IOException("A " + primitiveType + " topic carries a single value per message, but the "
+                    + "record has " + fields.size() + " fields " + fields + "; publish a single-field record "
+                    + "or use a topic whose schema is a record");
+        }
+
+        final String fieldName = fields.get(0);
+        return PrimitiveTopicSchema.encode(primitiveType, record.getValue(fieldName), fieldName);
+    }
+
     private void encodeWithTopicSchema(final Record record, final org.apache.avro.Schema avroSchema,
                                        final GenericDatumWriter<org.apache.avro.generic.GenericRecord> datumWriter,
                                        final BinaryEncoder encoder) throws IOException {
@@ -370,7 +479,11 @@ public class PublisherLease implements Closeable {
      * @param schema the schema of this value
      * @param value the value, already converted to the schema by {@link AvroTypeUtil}
      */
-    private static void writeAsJson(final JsonGenerator generator, final org.apache.avro.Schema schema,
+    /**
+     * Package-private so the KeyValue sides encode JSON the same way a whole message does (#190 review):
+     * a second, simpler JSON encoding there could not represent nested records.
+     */
+    static void writeAsJson(final JsonGenerator generator, final org.apache.avro.Schema schema,
                                     final Object value) throws IOException {
 
         if (value == null) {
@@ -462,6 +575,23 @@ public class PublisherLease implements Closeable {
     public long complete() {
         return this.messagesSent.get();
     }
+    /** A KeyValue SEPARATED key is the encoded key itself, so it goes on as bytes rather than a string. */
+    protected CompletableFuture<MessageId> sendAsyncWithKeyBytes(Producer producer, byte[] keyBytes, Map<String, String> properties, byte[] value) {
+        return producer.newMessage().properties(properties).keyBytes(keyBytes).value(value).sendAsync();
+    }
+
+    protected CompletableFuture<MessageId> sendWithKeyBytes(Producer producer, byte[] keyBytes, Map<String, String> properties, byte[] value)
+            throws PulsarClientException {
+        try {
+            return CompletableFuture.completedFuture(
+                    producer.newMessage().properties(properties).keyBytes(keyBytes).value(value).send());
+        } catch (final PulsarClientException e) {
+            final CompletableFuture<MessageId> failed = new CompletableFuture<>();
+            failed.completeExceptionally(e);
+            return failed;
+        }
+    }
+
     protected CompletableFuture<MessageId> sendAsync(Producer producer, String key, Map<String, String> properties, byte[] value) {
         TypedMessageBuilder tmb = producer.newMessage().properties(properties).value(value);
 
