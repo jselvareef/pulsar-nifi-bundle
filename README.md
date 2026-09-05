@@ -4,8 +4,9 @@
 
 | Bundle version | NiFi | Pulsar client | Java |
 |---|---|---|---|
+| `2.11.0` | 2.11.0 | 4.2.4 | 21 |
 | `2.10.0` | 2.10.0 | 4.2.4 | 21 |
-| `2.9.0-batchfix.8` | 2.9.0 | 4.2.2 | 21 |
+| `2.9.0-batchfix.9` | 2.9.0 | 4.2.2 | 21 |
 | `2.9.0` | 2.9.0 | 4.2.2 | 21 |
 | `2.1.0` | 2.1.0 | 3.3.7 | 21 |
 
@@ -17,17 +18,29 @@ The bundle version tracks the NiFi platform version it is built for; each releas
 line targets one Pulsar client major. See [VERSIONING.md](VERSIONING.md) for the
 full scheme, branching model, and release process.
 
-Release notes live in [`docs/release-notes/`](docs/release-notes/). `2.10.0` carries
-several behaviour changes — see [its notes](docs/release-notes/2.10.0.md) before upgrading.
+Release notes live in [`docs/release-notes/`](docs/release-notes/). `2.11.0` is a
+platform bump — see [its notes](docs/release-notes/2.11.0.md). If you are coming from
+`2.9.0` or earlier, read [the `2.10.0` notes](docs/release-notes/2.10.0.md) too: that
+release carries several behaviour changes.
 
-## Fork build `2.9.0-batchfix.8`
+## Fork build `2.9.0-batchfix.9`
 
-Fork build for **NiFi 2.9.0** (upstream `main` targets NiFi 2.10.0, whose NARs do not load on 2.9.0).
-It carries the complete upstream content of `v2.10.0.1` — every fix and feature in
+Fork build for **NiFi 2.9.0** (upstream `main` targets NiFi 2.11.0, whose NARs do not load on 2.9.0).
+It carries the complete upstream content of `v2.11.0` — every fix and feature in
+[docs/release-notes/2.11.0.md](docs/release-notes/2.11.0.md) and
 [docs/release-notes/2.10.0.md](docs/release-notes/2.10.0.md), including the behaviour changes listed
-there — rebuilt against NiFi 2.9.0 / Pulsar client 4.2.2 / Java 21. `src/main` is identical to
-upstream `main` at `64755dd`; the Testcontainers integration tests (`*IT.java`) are not carried on
-this build line because they need a Docker daemon.
+there — rebuilt against NiFi 2.9.0 / Pulsar client 4.2.2 / Java 21. `src/main` is upstream `main` at
+`00a6eb8` plus three fixes that are open upstream as pull requests and are carried here ahead of their
+merge:
+
+| Upstream | What it changes on this build |
+|---|---|
+| [#218](https://github.com/david-streamlio/pulsar-nifi-bundle/issues/218) / [PR #220](https://github.com/david-streamlio/pulsar-nifi-bundle/pull/220) | *Negative Acknowledgment Redelivery Delay* defaults to `1 sec` instead of `1 min`, and cannot exceed *Acknowledgment Timeout*: a message that could not be written comes back in about a second instead of a minute |
+| [#219](https://github.com/david-streamlio/pulsar-nifi-bundle/issues/219) / [PR #221](https://github.com/david-streamlio/pulsar-nifi-bundle/pull/221) | under the exclusive *Producer Access Modes* the publisher pool keeps one producer per topic, so `PublishPulsarRecord` with several Concurrent Tasks no longer fails or hangs against its own producers |
+| [#196](https://github.com/david-streamlio/pulsar-nifi-bundle/issues/196) / [PR #222](https://github.com/david-streamlio/pulsar-nifi-bundle/pull/222) | *Ordering Key* (`PublishPulsar`) and *Ordering Key Field* (`PublishPulsarRecord`), set independently of the message key |
+
+The Testcontainers integration tests (`*IT.java`) are not carried on this build line because they need a
+Docker daemon; they ran against the same code on the upstream pull requests.
 
 The version follows the `<nifi.version>[.<revision>]` scheme of [VERSIONING.md](VERSIONING.md) with a
 `-batchfix.N` qualifier so the artifacts cannot be confused with an upstream release. Both NARs must
@@ -89,6 +102,61 @@ starts a new record set - and a new FlowFile - just as a change in the mapped at
 > fields, give the reader an explicit schema (*Schema Text* or a schema registry): every message
 > then resolves to the same schema and the batch stays one FlowFile.
 
+## Failure handling and redelivery
+
+A consumed message leaves the processor by exactly one of three routes, and which one it took
+decides whether Pulsar ever delivers it again.
+
+| What happened | Route | Redelivered? |
+|---|---|---|
+| The message reached a FlowFile | `success`, acknowledged | No |
+| Its content could not be parsed | `parse_failure`, acknowledged | No |
+| It could not be written at all | rolled back, **negatively acknowledged** | Yes, promptly |
+| The Pulsar client itself failed | rolled back, left unacknowledged | Yes, after *Acknowledgment Timeout* |
+
+Acknowledgement happens only after the FlowFile carrying the message is committed, so a message
+is never acknowledged while its content could still be discarded.
+
+The third row is the one to know about. When the processor cannot write a message into a FlowFile
+— a full content repository, a permissions problem, a disk fault — it rolls the session back and
+**negatively acknowledges** the message, which asks the broker to redeliver it now. Without that
+the message is merely unacknowledged, and the broker cannot tell a consumer that has failed from
+one that is still working: it waits out *Acknowledgment Timeout*, thirty seconds by default and
+never less than ten. *Negative Acknowledgment Redelivery Delay* controls how soon the redelivery
+comes; it defaults to one second, and cannot be set longer than *Acknowledgment Timeout*. The
+reason for that rule: once a message is negatively acknowledged the client stops tracking it for
+the timeout, so the delay is the **only** thing that redelivers it — a delay longer than the timeout
+would make a write failure wait longer than a plain rollback did.
+
+> **Behaviour change since `2.11.0`:** in `2.11.0` the delay defaulted to Pulsar's own one minute,
+> so with *Acknowledgment Timeout* at its 30-second default a message the processor could not write
+> came back after **60 s — twice as long as before negative acknowledgement existed**, not sooner.
+> The default is now one second, so a flow that never set the property redelivers after a write
+> failure in about a second instead of a minute. A flow that had set the property to a value above
+> its *Acknowledgment Timeout* is now invalid and has to lower one or raise the other. To keep the
+> old gap on purpose, set the delay explicitly to a value no longer than the timeout.
+
+A message routed to `parse_failure` is **not** redelivered. It was delivered and handled — the
+flow has its bytes and can route them anywhere, including back to a Pulsar topic — so nacking it
+would hand the same content to the flow twice.
+
+### Dead letter topics
+
+Set *Max Redelivery Count* to attach a dead letter policy. Once a message has been redelivered
+more times than that, the broker moves it to a dead letter topic instead of delivering it again,
+so a message the flow can never accept stops blocking the subscription and is still there to
+inspect. *Dead Letter Topic* names the destination; leave it unset for the broker's own
+`<topic>-<subscription>-DLQ`.
+
+It is unset by default, so the broker redelivers indefinitely unless you ask otherwise. Two
+constraints worth knowing before you reach for it:
+
+- Pulsar builds a dead letter policy only for `Shared` and `Key_Shared` subscriptions. The
+  processor rejects the combination at validation rather than let a flow watch a dead letter
+  topic that can never receive anything.
+- It catches only messages that never reached the flow. A parse failure is acknowledged, so it
+  goes to `parse_failure` and never to the dead letter topic.
+
 ## Publisher message metadata
 
 `PublishPulsar` and `PublishPulsarRecord` set the message key and message properties from the
@@ -97,9 +165,20 @@ FlowFile:
 | Message field | Comes from |
 |---|---|
 | key | the *Message Key* property; if that is not set, the FlowFile attribute `msg.key` |
+| ordering key | the *Ordering Key* property; nothing is set when it is blank |
 | properties | the attributes named by *Mapped Message Properties* (`<property>[=<attribute>]`) |
 
-`PublishPulsarRecord` takes the key from the record field named by *Message Key Field* instead.
+`PublishPulsarRecord` takes the key from the record field named by *Message Key Field* instead, and
+the ordering key from the field named by *Ordering Key Field*.
+
+The two keys serve different concerns. The **message key** decides which partition a message is
+routed to and is the key topic compaction keeps the latest value for. The **ordering key** decides
+which consumer of a `Key_Shared` subscription receives the message, and takes precedence over the
+message key there. With no ordering key set Pulsar falls back to the message key, so the two are the
+same value — which is what every flow got before *Ordering Key* existed, and still gets when it is
+left blank. Set it when the unit you route and compact by is not the unit you need ordered delivery
+for: route and compact by tenant, order per session. Pair it with *Batch Builder* = `Key based` if
+batching is on, or a batch spanning several keys is dispatched as one unit.
 
 > **Behaviour change since `2.9.0`:** the *Message Key* property has always documented the
 > `msg.key` fallback, but it was never implemented — `getMessageKey()` read the property and
@@ -119,6 +198,12 @@ either mode, so keyed messages keep their order per key regardless of the settin
 validation. *Max Pending Messages* bounds the producer's queue of messages awaiting the
 broker's acknowledgement.
 
+*Hashing Scheme* picks the hash used to turn a key into a partition. It has to match every other
+producer writing the topic: two producers using different schemes send the same key to different
+partitions, which silently breaks per-key ordering for anything consuming it. `JavaStringHash`
+is the Java client's default and so this bundle's; `Murmur3_32Hash` is the cross-language one, and
+is what to use when clients in other languages also write the topic.
+
 > **Behaviour change since `2.9.0`:** neither property reached the producer since the publish
 > processors were refactored in 2023 — the producer always ran with the client defaults. A flow
 > that has *Message Routing Mode* set to `SinglePartition` will now really route its unkeyed
@@ -136,6 +221,35 @@ broker's acknowledgement.
 > against a remote or loaded broker than in testing. If you publish large FlowFiles asynchronously,
 > either raise *Max Pending Messages*, set it to `0` to restore the previous unbounded behaviour, or
 > enable *Block if Message Queue Full* so sends wait instead of failing.
+
+## Producer behaviour
+
+*Send Timeout* bounds how long a single send may take. A message the broker has not acknowledged
+within it fails, and its FlowFile is routed to `failure`. It defaults to 30 seconds; set it to `0`
+to wait indefinitely, which is what a flow that must never drop a message wants — and what
+Pulsar's broker-side deduplication requires.
+
+*Producer Access Mode* is how you stop two flows writing the same topic. `Shared`, the default,
+lets any number of producers write. `Exclusive` fails at producer creation if another producer
+already holds the topic; `WaitForExclusive` queues until it can take over; `ExclusiveWithFencing`
+evicts the incumbent and takes the topic. Under any of the three the processor keeps **one
+producer per topic**, whatever its Concurrent Tasks: a task that needs a topic whose producer is
+busy waits for it instead of opening a second one, so the exclusivity is held against other flows
+and never turned against the processor itself.
+
+> **Behaviour change since `2.11.0`:** in `2.11.0` the publisher pool opened one producer per
+> concurrently held lease, so `PublishPulsarRecord` with more than one Concurrent Task collided
+> with its own producers under the exclusive modes: with `Exclusive` part of the FlowFiles went to
+> `failure` ("Topic has an existing exclusive producer" — its own), with `ExclusiveWithFencing`
+> the producers fenced each other, and with `WaitForExclusive` the second task blocked inside
+> `onTrigger` for good. Those flows now publish everything through the topic's single producer.
+> `Shared` is unchanged: concurrent tasks still get concurrent producers.
+
+*Batch Builder* decides how messages are grouped when *Batching Enabled* is on. `Default` fills a
+batch with whatever is pending, interleaving keys. **`Key based` is required for per-key ordering
+on a `Key_Shared` subscription**: a consumer receives a whole batch at a time, so a batch spanning
+several keys hands one consumer messages belonging to another consumer's key range. It has no
+effect when batching is off.
 
 ## Consuming from topics that have a schema
 
