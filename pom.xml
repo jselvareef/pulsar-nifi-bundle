@@ -25,7 +25,7 @@
     
     <groupId>io.streamnative.connectors</groupId>
     <artifactId>nifi-pulsar-bundle</artifactId>
-    <version>2.9.0-batchfix.8</version>
+    <version>2.9.0-batchfix.9</version>
     <packaging>pom</packaging>
 
     <name>NiFi Pulsar Connectors :: NiFi Pulsar Bundle</name>
