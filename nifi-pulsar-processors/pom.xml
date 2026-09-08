@@ -153,7 +153,16 @@
   			<artifactId>mockito-core</artifactId>
   			<version>${mockito-core.version}</version>
 		</dependency>
-        
+
+        <!-- The real client service, for tests that read the configuration a real (unconnected)
+             PulsarClient ends up with; upstream declares it for its integration tests too. -->
+        <dependency>
+            <groupId>io.streamnative.connectors</groupId>
+            <artifactId>nifi-pulsar-client-service</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+
     </dependencies>
 
 </project>

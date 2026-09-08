@@ -36,6 +36,7 @@ import org.apache.nifi.processor.*;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.processors.pulsar.utils.PropertyMappingUtils;
 import org.apache.nifi.processors.pulsar.utils.PublisherPool;
+import org.apache.nifi.processors.pulsar.utils.PublisherUnavailableException;
 import org.apache.nifi.pulsar.PulsarClientService;
 import org.apache.nifi.pulsar.cache.PulsarConsumerLRUCache;
 import org.apache.pulsar.client.api.CompressionType;
@@ -326,20 +327,6 @@ public abstract class AbstractPulsarProducerProcessor<T> extends AbstractProcess
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
-    public static final PropertyDescriptor ORDERING_KEY = new PropertyDescriptor.Builder()
-            .name("ORDERING_KEY")
-            .displayName("Ordering Key")
-            .description("Pulsar's ordering key for the message, set independently of the Message Key. The message "
-                    + "key routes the message to a partition and drives topic compaction; the ordering key decides "
-                    + "which consumer of a Key_Shared subscription receives the message and takes precedence over the "
-                    + "message key there. Set it when the unit you compact or route by (a tenant, a device) is not the "
-                    + "unit you need ordered delivery for (a session, a transaction). When not specified no ordering "
-                    + "key is set and Pulsar falls back to the message key, as before.")
-            .required(false)
-            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
-            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
-            .build();
-
     protected static final List<PropertyDescriptor> PROPERTIES;
     protected static final Set<Relationship> RELATIONSHIPS;
 
@@ -367,7 +354,6 @@ public abstract class AbstractPulsarProducerProcessor<T> extends AbstractProcess
         descriptorList.add(BATCHER_BUILDER);
         descriptorList.add(MAPPED_MESSAGE_PROPERTIES);
         descriptorList.add(MESSAGE_KEY);
-        descriptorList.add(ORDERING_KEY);
 
         PROPERTIES = Collections.unmodifiableList(descriptorList);
 
@@ -511,18 +497,28 @@ public abstract class AbstractPulsarProducerProcessor<T> extends AbstractProcess
         this.publisherPool = pool;
     }
 
+    /**
+     * The topic's only producer is with another task and did not come back within the pool's wait, so nothing was
+     * attempted for this FlowFile - or for the rest of the batch, which needs the same lease or one just as busy.
+     * They go back to the queue they came from, not to {@code failure}: a FlowFile routed to failure was tried and
+     * refused, and these were not. The yield keeps the next trigger from spinning on the same held producer.
+     */
+    protected void returnToQueueAndYield(final ProcessContext context, final ProcessSession session,
+                                         final FlowFile flowFile, final Iterator<FlowFile> rest,
+                                         final PublisherUnavailableException cause) {
+        int returned = 1;
+        session.transfer(flowFile);
+        while (rest.hasNext()) {
+            session.transfer(rest.next());
+            returned++;
+        }
+        getLogger().warn("{}; {} FlowFile(s) returned to the queue to be retried", cause.getMessage(), returned);
+        context.yield();
+    }
+
     protected byte[] getDemarcatorBytes(ProcessContext context, final FlowFile flowFile) {
         return context.getProperty(MESSAGE_DEMARCATOR).isSet() ? context.getProperty(MESSAGE_DEMARCATOR)
                 .evaluateAttributeExpressions(flowFile).getValue().getBytes(StandardCharsets.UTF_8) : null;
-    }
-
-    /**
-     * The ordering key for the FlowFile's messages, or {@code null} when the property is unset or evaluates to
-     * nothing - in which case no ordering key is set and Pulsar's own fallback to the message key applies.
-     */
-    protected byte[] getOrderingKey(ProcessContext context, final FlowFile flowFile) {
-        final String orderingKey = context.getProperty(ORDERING_KEY).evaluateAttributeExpressions(flowFile).getValue();
-        return StringUtils.isBlank(orderingKey) ? null : orderingKey.getBytes(StandardCharsets.UTF_8);
     }
 
     protected String getMessageKey(ProcessContext context, final FlowFile flowFile) {

@@ -163,7 +163,9 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
             .name("AUTO_UPDATE_PARTITION_INTERVAL")
             .displayName("Auto Update Partition Interval")
             .description("Set the interval of updating partitions (default: 1 minute). This only works if " +
-                    "autoUpdatePartitions is enabled.")
+                    "autoUpdatePartitions is enabled. The Pulsar client keeps this interval in whole seconds: " +
+                    "the shortest interval it accepts is one second, and a fraction of a second is dropped - " +
+                    "the processor logs the value actually applied when it starts.")
             .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
             .defaultValue("1 min")
             .required(false)
@@ -209,11 +211,13 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
                     + "to the flow. A message whose FlowFile could not be written is negatively acknowledged "
                     + "rather than left to expire, and from that moment this delay is the only thing that "
                     + "redelivers it: a negatively acknowledged message is no longer subject to the Acknowledgment "
-                    + "Timeout. The delay therefore cannot be longer than the Acknowledgment Timeout, and defaults "
-                    + "to well under it. The Acknowledgment Timeout remains the ceiling for a message that was "
-                    + "never acted on at all.")
+                    + "Timeout. The default is therefore kept under the shortest Acknowledgment Timeout allowed, "
+                    + "and a delay longer than the Acknowledgment Timeout is logged as a warning when the processor "
+                    + "starts. Each redelivery also counts against Max Redelivery Count, so a shorter delay reaches "
+                    + "the dead letter topic sooner. The Acknowledgment Timeout remains the ceiling for a message "
+                    + "that was never acted on at all.")
             .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
-            .defaultValue("1 sec")
+            .defaultValue("5 sec")
             .required(false)
             .build();
 
@@ -245,7 +249,8 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
             .name("EXPIRE_TIME_OF_INCOMPLETE_CHUNKED_MESSAGE")
             .displayName("Expire Time of Incomplete Chunked Message")
             .description("If producer fails to publish all the chunks of a message then consumer can expire incomplete" +
-                    " chunks if consumer won't be able to receive all chunks in expire times (default 1 minute).")
+                    " chunks if consumer won't be able to receive all chunks in expire times (default 1 minute). " +
+                    "Applied with millisecond precision.")
             .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
             .defaultValue("60 sec")
             .required(false)
@@ -460,17 +465,17 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
                "Acknowledgment Timeout needs to be greater than 10 seconds.").build());
         }
 
-        // Once a message is negatively acknowledged the client stops tracking it for the Acknowledgment Timeout,
-        // so the redelivery delay is the only thing that brings it back. A delay longer than the timeout would
-        // make a message the processor could not write wait longer than a plain rollback did (#218).
-        final long ackTimeoutMillis = validationContext.getProperty(ACK_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS);
-        final long negativeAckDelayMillis = validationContext.getProperty(NEGATIVE_ACK_REDELIVERY_DELAY)
+        // The client stores the partition update interval in whole seconds and refuses zero
+        // ("interval needs to be > 0"), so a value under a second reached it as 0 and the consumer could not
+        // be created: every trigger failed with a message about an interval the user never typed (#225).
+        // Rejecting it here fails nothing that runs today.
+        final long partitionUpdateIntervalMillis = validationContext.getProperty(AUTO_UPDATE_PARTITION_INTERVAL)
                 .asTimePeriod(TimeUnit.MILLISECONDS);
-        if (negativeAckDelayMillis > ackTimeoutMillis) {
-            results.add(new ValidationResult.Builder().valid(false).subject(NEGATIVE_ACK_REDELIVERY_DELAY.getDisplayName())
-                .explanation("a negatively acknowledged message is redelivered by this delay alone, so it cannot be "
-                    + "longer than the Acknowledgment Timeout (" + validationContext.getProperty(ACK_TIMEOUT).getValue()
-                    + "); a longer delay would make a message that could not be written wait longer than before")
+        if (partitionUpdateIntervalMillis < TimeUnit.SECONDS.toMillis(1)) {
+            results.add(new ValidationResult.Builder().valid(false).subject(AUTO_UPDATE_PARTITION_INTERVAL.getDisplayName())
+                .explanation("the Pulsar client keeps this interval in whole seconds and accepts nothing under one second; "
+                    + validationContext.getProperty(AUTO_UPDATE_PARTITION_INTERVAL).getValue()
+                    + " would reach it as 0 and the consumer could not be created")
                 .build());
         }
 
@@ -498,11 +503,14 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
 
     @OnScheduled
     public void init(ProcessContext context) {
+        warnIfNegativeAckDelayExceedsAckTimeout(context);
+
         // Record the size only. Replacing the cache here would abandon the consumers the previous one
         // holds without closing them, and the broker then refuses the replacement consumer on an
         // Exclusive subscription with "Exclusive consumer is already connected". The cache is built
         // lazily below and disposed in cleanUp().
         this.consumerCacheSize = context.getProperty(CONSUMER_CACHE_SIZE).asInteger();
+        warnIfPartitionUpdateIntervalLosesAFraction(context);
 
         if (context.getProperty(ASYNC_ENABLED).isSet() && context.getProperty(ASYNC_ENABLED).asBoolean()) {
             setConsumerPool(Executors.newFixedThreadPool(context.getProperty(MAX_ASYNC_REQUESTS).asInteger()));
@@ -512,6 +520,39 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
         }
 
         setPulsarClientService(context.getProperty(PULSAR_CLIENT_SERVICE).asControllerService(PulsarClientService.class));
+    }
+
+    /**
+     * Once a message is negatively acknowledged the client stops tracking it for the Acknowledgment Timeout, so
+     * the redelivery delay is the only thing that brings it back. A delay longer than the timeout therefore makes
+     * a message the processor could not write wait longer than a plain rollback did (#218). That can be a
+     * deliberate backoff, so it is allowed - but it is worth a warning, because nothing else connects the two.
+     */
+    private void warnIfNegativeAckDelayExceedsAckTimeout(final ProcessContext context) {
+        final long ackTimeoutMillis = context.getProperty(ACK_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS);
+        final long negativeAckDelayMillis = context.getProperty(NEGATIVE_ACK_REDELIVERY_DELAY).asTimePeriod(TimeUnit.MILLISECONDS);
+        if (negativeAckDelayMillis > ackTimeoutMillis) {
+            getLogger().warn("{} ({}) is longer than {} ({}). A negatively acknowledged message is redelivered by that "
+                    + "delay alone, so a message this processor cannot write will wait longer than it would have with "
+                    + "no negative acknowledgement at all. Lower the delay unless the longer wait is intended.",
+                    NEGATIVE_ACK_REDELIVERY_DELAY.getDisplayName(), context.getProperty(NEGATIVE_ACK_REDELIVERY_DELAY).getValue(),
+                    ACK_TIMEOUT.getDisplayName(), context.getProperty(ACK_TIMEOUT).getValue());
+        }
+    }
+
+    /**
+     * The client keeps Auto Update Partition Interval in whole seconds, so a fraction of a second in the configured
+     * value is not applied. A value under a second is rejected by {@link #customValidate}; one of a second or more
+     * with a fraction runs, only coarser than asked, and this says so once per start rather than never (#225).
+     */
+    private void warnIfPartitionUpdateIntervalLosesAFraction(final ProcessContext context) {
+        final long configuredMillis = context.getProperty(AUTO_UPDATE_PARTITION_INTERVAL).asTimePeriod(TimeUnit.MILLISECONDS);
+        if (configuredMillis % TimeUnit.SECONDS.toMillis(1) != 0) {
+            getLogger().warn("{} is set to {}, which the Pulsar client applies as {} seconds: it keeps this interval in "
+                    + "whole seconds, so the fraction of a second is dropped",
+                    AUTO_UPDATE_PARTITION_INTERVAL.getDisplayName(), context.getProperty(AUTO_UPDATE_PARTITION_INTERVAL).getValue(),
+                    TimeUnit.MILLISECONDS.toSeconds(configuredMillis));
+        }
     }
 
     @OnUnscheduled
@@ -660,8 +701,11 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
                 .negativeAckRedeliveryDelay(context.getProperty(NEGATIVE_ACK_REDELIVERY_DELAY)
                         .asTimePeriod(TimeUnit.MICROSECONDS), TimeUnit.MICROSECONDS)
                 .autoAckOldestChunkedMessageOnQueueFull(context.getProperty(AUTO_ACK_OLDEST_CHUNKED_ON_QUEUE_FULL).asBoolean())
+                // The client stores this in milliseconds, so hand it over in milliseconds: converting to whole
+                // seconds here dropped any fraction, and turned a sub-second value into 0, which disables the
+                // expiry altogether (#225).
                 .expireTimeOfIncompleteChunkedMessage(context.getProperty(EXPIRE_TIME_OF_INCOMPLETE_CHUNKED_MESSAGE)
-                        .asTimePeriod(TimeUnit.SECONDS), TimeUnit.SECONDS)
+                        .asTimePeriod(TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS)
                 .maxPendingChunkedMessage(context.getProperty(MAX_PENDING_CHUNKED_MESSAGE).asInteger())
                 .priorityLevel(context.getProperty(PRIORITY_LEVEL).asInteger())
                 .receiverQueueSize(context.getProperty(RECEIVER_QUEUE_SIZE).asInteger())
@@ -742,20 +786,25 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
      * nor recoverable from Pulsar. The acknowledgement now runs in the commit callback, so a session that
      * is never committed acknowledges nothing and the broker redelivers its messages instead.
      * <p>
-     * Shared and Key_Shared subscriptions do not permit cumulative acknowledgements, so every message is
-     * acknowledged individually; the other subscription types acknowledge cumulatively up to the last
-     * message. In asynchronous mode the acknowledgements are submitted to the acknowledgement service and
-     * collected by {@link #drainAcknowledgments()}, as before. {@code messages} is emptied so the caller
-     * can keep collecting the messages of the next commit in the same list.
+     * Every message is acknowledged individually, on every subscription type. Exclusive and Failover
+     * subscriptions used to acknowledge cumulatively up to the last message of the batch, and a cumulative
+     * acknowledgement covers everything before that message on the subscription - not only this batch. Two
+     * things can be "before" it and not belong to the batch: a message a concurrent task is still holding,
+     * and a message this task received earlier, failed to write and negatively acknowledged, which is waiting
+     * for redelivery. Both were acknowledged along with the batch and never came back (#223). Acknowledging
+     * each message names exactly what was committed. The client groups the acknowledgements into one command
+     * anyway ({@code acknowledgementsGroupTimeMicros}), so a batch costs the broker one round trip either way.
+     * In asynchronous mode the acknowledgements are submitted to the acknowledgement service and collected by
+     * {@link #drainAcknowledgments()}, as before. {@code messages} is emptied so the caller can keep collecting
+     * the messages of the next commit in the same list.
      *
      * @param session  the session holding the FlowFiles the messages were written to
      * @param consumer the consumer the messages were received from
      * @param messages the messages carried by the FlowFiles in the session; cleared on return
-     * @param shared   whether the subscription is Shared or Key_Shared
      * @param async    whether to acknowledge through the asynchronous acknowledgement service
      */
     protected void commitAndAcknowledge(final ProcessSession session, final Consumer<GenericRecord> consumer,
-                                        final List<Message<GenericRecord>> messages, final boolean shared, final boolean async) {
+                                        final List<Message<GenericRecord>> messages, final boolean async) {
         if (messages.isEmpty()) {
             return;
         }
@@ -763,7 +812,7 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
         final List<Message<GenericRecord>> committed = new ArrayList<>(messages);
         messages.clear();
 
-        session.commitAsync(() -> acknowledge(consumer, committed, shared, async));
+        session.commitAsync(() -> acknowledge(consumer, committed, async));
     }
 
     /**
@@ -799,25 +848,15 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
     }
 
     private void acknowledge(final Consumer<GenericRecord> consumer, final List<Message<GenericRecord>> messages,
-                             final boolean shared, final boolean async) {
+                             final boolean async) {
         final ExecutorCompletionService<Object> service = async ? getAckService() : null;
 
         try {
-            if (shared) {
-                for (final Message<GenericRecord> message : messages) {
-                    if (service != null) {
-                        service.submit(() -> consumer.acknowledgeAsync(message).get());
-                    } else {
-                        consumer.acknowledge(message);
-                    }
-                }
-            } else {
-                final Message<GenericRecord> last = messages.get(messages.size() - 1);
-
+            for (final Message<GenericRecord> message : messages) {
                 if (service != null) {
-                    service.submit(() -> consumer.acknowledgeCumulativeAsync(last).get());
+                    service.submit(() -> consumer.acknowledgeAsync(message).get());
                 } else {
-                    consumer.acknowledgeCumulative(last);
+                    consumer.acknowledge(message);
                 }
             }
         } catch (final PulsarClientException e) {
@@ -917,10 +956,5 @@ public abstract class AbstractPulsarConsumerProcessor<T> extends AbstractProcess
 
         return msg.getKey();
     }
-    
-    protected boolean isSharedSubscription(ProcessContext context) {
-    	final String subscriptionType = context.getProperty(SUBSCRIPTION_TYPE).getValue();
-    	
-    	return subscriptionType.equalsIgnoreCase(SHARED.getValue()) || subscriptionType.equalsIgnoreCase(KEY_SHARED.getValue());
-    }
+
 }
