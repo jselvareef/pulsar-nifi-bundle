@@ -4,7 +4,7 @@
 
 | Bundle version | NiFi | Pulsar client | Java |
 |---|---|---|---|
-| `2.9.0-batchfix.10` | 2.9.0 | 4.2.2 | 21 |
+| `2.9.0-batchfix.11` | 2.9.0 | 4.2.2 | 21 |
 | `2.11.0.1` | 2.11.0 | 4.2.4 | 21 |
 | `2.11.0` | 2.11.0 | 4.2.4 | 21 |
 | `2.10.0` | 2.10.0 | 4.2.4 | 21 |
@@ -25,22 +25,22 @@ platform bump ([notes](docs/release-notes/2.11.0.md)). If you are coming from
 `2.9.0` or earlier, read [the `2.10.0` notes](docs/release-notes/2.10.0.md) too: that
 release carries several behaviour changes.
 
-## Fork build `2.9.0-batchfix.10`
+## Fork build `2.9.0-batchfix.11`
 
 Fork build for **NiFi 2.9.0** (upstream `main` targets NiFi 2.11.0, whose NARs do not load on 2.9.0).
-It carries the complete upstream content of `v2.11.0.1` — every fix and feature in
-[docs/release-notes/2.11.0.1.md](docs/release-notes/2.11.0.1.md),
-[docs/release-notes/2.11.0.md](docs/release-notes/2.11.0.md) and
-[docs/release-notes/2.10.0.md](docs/release-notes/2.10.0.md), including the behaviour changes listed
-there — rebuilt against NiFi 2.9.0 / Pulsar client 4.2.2 / Java 21. `src/main` is upstream `main` at
-`35d9212` plus three changes that are open upstream as pull requests and are carried here ahead of their
-merge; their release notes are in [docs/release-notes/2.11.0.2.md](docs/release-notes/2.11.0.2.md):
+It carries the complete upstream content of `main` at `554c9b2` — `v2.11.0.1` plus everything merged
+since: the ordering key (#196), the Avro `bytes` message key fix (#226), the consumer time properties
+(#225) and the four consumer topic properties (#187), all listed in
+[docs/release-notes/2.11.0.2.md](docs/release-notes/2.11.0.2.md), on top of
+[2.11.0.1](docs/release-notes/2.11.0.1.md), [2.11.0](docs/release-notes/2.11.0.md) and
+[2.10.0](docs/release-notes/2.10.0.md), including the behaviour changes listed there — rebuilt against
+NiFi 2.9.0 / Pulsar client 4.2.2 / Java 21. On top, two changes that are open upstream as pull requests
+and are carried here ahead of their merge:
 
 | Upstream | What it changes on this build |
 |---|---|
-| [#196](https://github.com/david-streamlio/pulsar-nifi-bundle/issues/196), [#226](https://github.com/david-streamlio/pulsar-nifi-bundle/issues/226) / [PR #222](https://github.com/david-streamlio/pulsar-nifi-bundle/pull/222) | *Ordering Key* (`PublishPulsar`) and *Ordering Key Field* (`PublishPulsarRecord`), set independently of the message key; and *Message Key Field* on an Avro `bytes` field now yields the field's bytes instead of an identity hash that differed per record |
 | [#223](https://github.com/david-streamlio/pulsar-nifi-bundle/issues/223) / [PR #224](https://github.com/david-streamlio/pulsar-nifi-bundle/pull/224) | every message is acknowledged individually on every subscription type; on `Exclusive` and `Failover` the cumulative acknowledgement used to take along a message pending redelivery after a write failure, which was then lost |
-| [#225](https://github.com/david-streamlio/pulsar-nifi-bundle/issues/225) / [PR #228](https://github.com/david-streamlio/pulsar-nifi-bundle/pull/228) | *Expire Time of Incomplete Chunked Message* is applied to the millisecond; *Auto Update Partition Interval* under one second is rejected at validation instead of failing every trigger, and a fraction above that is warned about |
+| [#233](https://github.com/david-streamlio/pulsar-nifi-bundle/issues/233) / [PR #238](https://github.com/david-streamlio/pulsar-nifi-bundle/pull/238) | test only: the acknowledgement-leak regression test measures after the acknowledgements complete instead of bounding what is in flight, so it no longer fails on a loaded machine |
 
 The Testcontainers integration tests (`*IT.java`) are not carried on this build line because they need a
 Docker daemon; they ran against the same code on the upstream pull requests.
@@ -198,14 +198,20 @@ FlowFile:
 
 `PublishPulsarRecord` takes the key from the record field named by *Message Key Field* instead, and
 the ordering key from the field named by *Ordering Key Field*; it has no FlowFile-level *Ordering
-Key*. Both fields are converted the same way — text as UTF-8, an Avro `bytes` field as its bytes, a
-nested record as the Record Writer writes it — so naming one field under both properties gives the
-same key twice, and a blank value means no ordering key.
+Key*. Both fields yield the same bytes — text as UTF-8, an Avro `bytes` field as its bytes, a nested
+record as the Record Writer writes it — so naming one field under both properties keys and orders by
+the same value. A **binary** field travels as a binary message key (Pulsar's `keyBytes`: base64 on
+the wire, flagged as such, so two different byte strings are always two different keys) and as the
+raw ordering key; a text field is the text under both. A blank value means no ordering key. A field
+name that is not in the records' schema is warned about once per FlowFile, since it would otherwise
+set no key for any record without a sign of the typo.
 
 > **Behaviour change since `2.11.0`:** *Message Key Field* naming an Avro `bytes` field used to
 > publish the **identity hash of the array** (`[Ljava.lang.Object;@5cf57368`) as the key — a
 > different value for every record, so records that shared a key were spread over partitions at
-> random and nothing was ever compacted away (#226). The key is now the field's bytes. A flow that
+> random and nothing was ever compacted away (#226). The key is now the field's bytes, sent as a
+> binary key rather than decoded into text — a charset decode would map every invalid byte sequence
+> to the same replacement character and could merge two different keys. A flow that
 > keys by an Avro `bytes` field will see its messages start landing on the partition their key
 > hashes to, and a compacted topic fed that way will start keeping one message per key.
 
@@ -260,6 +266,67 @@ is what to use when clients in other languages also write the topic.
 > either raise *Max Pending Messages*, set it to `0` to restore the previous unbounded behaviour, or
 > enable *Block if Message Queue Full* so sends wait instead of failing.
 
+## Choosing what to consume
+
+*Topics* and *Topics Pattern* are alternatives; exactly one must be set.
+
+A pattern matches **persistent topics only** by default, which is why a pattern that plainly
+matches a non-persistent topic can appear to do nothing. *Topics Pattern Match Mode* changes
+that — `PersistentOnly` (the default and the previous behaviour), `NonPersistentOnly`, or
+`AllTopics`. *Topics Pattern Discovery Interval* is how often the client re-evaluates the
+pattern, and so the worst-case delay before a newly created matching topic is read. Both are
+ignored when *Topics* is used — with one exception: the discovery interval is still bounded to a
+whole number of seconds within `int` range whichever is set, because the client checks that bound
+when it builds any consumer, not only a pattern one.
+
+*Subscription Mode* decides whether the broker keeps a cursor. `Durable` (the default) survives
+a restart and resumes where it left off. `NonDurable` leaves no cursor: the subscription exists
+only while the consumer is connected, which is what tailing wants, and it accumulates no backlog
+on the broker while the flow is stopped. What it gives up is delivery across restarts — with no
+cursor there is no resume point, so a `NonDurable` subscription set to *Subscription Initial
+Position* `Earliest` re-reads the topic from the beginning every time it is scheduled, and every
+time a consumer is evicted from the cache. The processor warns when it starts in that state.
+Worth knowing because the *Read Compacted* guidance below sends you to `Earliest`.
+
+*Read Compacted* reads the compacted view of a topic — the latest value per key — instead of its
+backlog. Messages without a key are not delivered at all, and the topic must actually have
+compaction running for there to be a compacted view; without it the subscription reads the normal
+backlog.
+
+*Read Compacted* has two requirements, and the client states both: *"Read compacted can only be used
+with exclusive or failover **persistent** subscriptions"*.
+
+- **A single active consumer** — so `Exclusive` or `Failover`.
+- **The persistent domain** — only a persistent topic has a compacted view. A `non-persistent://`
+  topic named literally in *Topics* is rejected at validation, as is a *Topics Pattern* whose *Match
+  Mode* admits non-persistent topics. A topic supplied by an expression is only checked if the
+  expression resolves at startup — an environment variable or a system property does, and a
+  non-persistent topic from one of those is warned about when the processor starts. A topic taken
+  from FlowFile attributes does not resolve at startup, so neither validation nor the warning can
+  see it and the client is what refuses the subscription. That second case matters because the client cannot catch it: with a pattern its topic list
+  is empty, so its own domain check passes vacuously and any non-persistent topic the pattern matches
+  is served as a live stream — the flow would read a full stream while its configuration says it is
+  reading the latest value per key, with nothing reporting it. A `non-persistent://` prefix on the
+  *pattern itself* is not rejected, because it is inert: the client strips the scheme from the pattern
+  and from every candidate topic, so the domain comes from *Match Mode* alone.
+
+> **Set *Subscription Initial Position* to `Earliest`.** The compacted view is the history of the
+> topic — the latest value for each key seen so far. A new subscription left at the default of
+> `Latest` starts at the tail, so a compacted read delivers **nothing at all** until a new message
+> arrives, which looks identical to a broken flow.
+
+> **The two single-consumer constraints are mirror images.** A compacted read needs a *single
+> active consumer*, so Pulsar permits it only on `Exclusive` and `Failover`. A dead letter policy
+> needs *competing* consumers, so Pulsar builds one only for `Shared` and `Key_Shared`. No
+> subscription type satisfies both, and the processor rejects each on the wrong type at validation
+> rather than letting the client fail at subscribe time.
+
+> **Concurrent Tasks and non-Shared subscriptions.** Because *Read Compacted* requires `Exclusive` or
+> `Failover`, flows using it are on a subscription type where *Concurrent Tasks* > 1 is not currently
+> safe: one task's cumulative acknowledgement can acknowledge messages another task still holds. See
+> [#223](https://github.com/david-streamlio/pulsar-nifi-bundle/issues/223). Run these flows with a
+> single task until that is resolved.
+
 ## Producer behaviour
 
 *Send Timeout* bounds how long a single send may take. A message the broker has not acknowledged
@@ -298,23 +365,32 @@ effect when batching is off.
 
 ## Consumer time properties
 
-Two consumer properties are handed to the Pulsar client in units coarser than NiFi lets you type
-them in, and behave accordingly.
+NiFi time-period values always carry a unit (`500 millis`, `90 sec`, `1 min`), so the only question
+for a property the Pulsar client stores in a coarser unit is whether the duration you typed is
+representable in the granularity the client keeps. Where it is not, the value is **rejected at
+validation** rather than silently applied as something else.
 
-*Auto Update Partition Interval* is kept by the client in **whole seconds**, and the client refuses
-zero. A value under one second is therefore rejected at validation — before this rule it validated
-and then failed on every trigger with the client's `interval needs to be > 0`, about an interval
-nobody typed. A value of a second or more with a fraction (`90500 millis`) runs, on the whole
-seconds the client keeps (`90`), and the processor logs a warning saying so when it starts.
+*Auto Update Partition Interval* is kept by the client as a whole number of **seconds**, in an `int`,
+and the client refuses zero. The value must therefore be a whole number of seconds between `1 sec`
+and `2147483647 sec`: `500 millis` would reach the client as `0` and be refused on every trigger,
+`90500 millis` would run as `90 sec` while the configuration says otherwise, and anything past the
+`int` range wrapped around — `30000 days` became a negative interval and failed, `10000 weeks` ran
+silently as about 55 years instead of 191. *Topics Pattern Discovery Interval* follows the same rule
+for the same reason.
 
-*Expire Time of Incomplete Chunked Message* is kept by the client in milliseconds and is applied
-exactly as configured.
+*Expire Time of Incomplete Chunked Message* is kept by the client as a whole number of
+**milliseconds**, so any whole-millisecond value is applied exactly as configured; a fraction of a
+millisecond is rejected. `0` is a deliberate value: it disables the expiry, and incomplete chunks are
+then kept until the pending-chunk queue evicts them.
 
-> **Behaviour change since `2.11.0`:** *Expire Time of Incomplete Chunked Message* used to be
-> converted to whole seconds on the way to the client, so a fraction was dropped and a sub-second
-> value became `0` — which the client reads as **never expire**: incomplete chunks were kept until
-> the pending-chunk queue evicted them. A flow that set `500 millis` now expires them after 500 ms,
-> and `1500 millis` means 1.5 s rather than 1 s. Whole-second values are unchanged.
+> **Behaviour change since `2.1.0`:** every release so far converted *Expire Time of Incomplete
+> Chunked Message* to whole seconds on the way to the client, so a fraction of a second was dropped
+> and a sub-second value became `0` — which the client reads as **never expire**. A flow that set
+> `500 millis` had no chunk expiry at all; it now expires incomplete chunks after 500 ms, and
+> `1500 millis` means 1.5 s rather than 1 s. Whole-second values are unchanged. On *Auto Update
+> Partition Interval*, a value that is not a whole number of seconds in the `int` range is now
+> invalid; a sub-second value was already failing every trigger, so the only flows this stops are
+> ones that ran on a different interval from the one configured.
 
 ## Consuming from topics that have a schema
 
